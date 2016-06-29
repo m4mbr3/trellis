@@ -1,0 +1,933 @@
+diff --git a/include/clang/Basic/Attr.td b/include/clang/Basic/Attr.td
+index 704a375..c981967 100644
+--- a/include/clang/Basic/Attr.td
++++ b/include/clang/Basic/Attr.td
+@@ -1870,3 +1870,9 @@ def LoopHint : Attr {
+ 
+   let Documentation = [LoopHintDocs, UnrollHintDocs];
+ }
++
++def PrivilegeSeparation : InheritableAttr {
++  let Spellings = [GNU<"privilegeSeparation">];
++  let Args = [IntArgument<"privilegeLevel">];
++  let Documentation = [Undocumented];
++}
+diff --git a/lib/CodeGen/CGDecl.cpp b/lib/CodeGen/CGDecl.cpp
+index 91f8041..58e511c 100644
+--- a/lib/CodeGen/CGDecl.cpp
++++ b/lib/CodeGen/CGDecl.cpp
+@@ -197,7 +197,11 @@ CodeGenFunction::CreateStaticVarDecl(const VarDecl &D,
+                              AddrSpace);
+   GV->setAlignment(getContext().getDeclAlign(&D).getQuantity());
+   CGM.setGlobalVisibility(GV, &D);
+-
++  if(D.hasAttr<PrivilegeSeparationAttr>()) {
++    PrivilegeSeparationAttr *PSA = D.getAttr<PrivilegeSeparationAttr>();
++    uint32_t pl = PSA->getPrivilegeLevel();
++    GV->setPrivilegeSeparation(pl);
++  }
+   if (D.getTLSKind())
+     CGM.setTLSMode(GV, D);
+ 
+@@ -272,6 +276,11 @@ CodeGenFunction::AddInitializerToStaticVarDecl(const VarDecl &D,
+     llvm::Constant *NewPtrForOldDecl =
+     llvm::ConstantExpr::getBitCast(GV, OldGV->getType());
+     OldGV->replaceAllUsesWith(NewPtrForOldDecl);
++    if(D.hasAttr<PrivilegeSeparationAttr>()) {
++        PrivilegeSeparationAttr *PSA = D.getAttr<PrivilegeSeparationAttr>();
++        uint32_t pl = PSA->getPrivilegeLevel();
++        GV->setPrivilegeSeparation(pl);
++    }
+ 
+     // Erase the old global, since it is no longer used.
+     OldGV->eraseFromParent();
+@@ -332,6 +341,12 @@ void CodeGenFunction::EmitStaticVarDecl(const VarDecl &D,
+   if (const SectionAttr *SA = D.getAttr<SectionAttr>())
+     var->setSection(SA->getName());
+ 
++  if(D.hasAttr<PrivilegeSeparationAttr>()) {
++    PrivilegeSeparationAttr *PSA = D.getAttr<PrivilegeSeparationAttr>();
++    uint32_t pl = PSA->getPrivilegeLevel();
++    var->setPrivilegeSeparation(pl);
++  }
++
+   if (D.hasAttr<UsedAttr>())
+     CGM.addUsedGlobal(var);
+ 
+@@ -724,7 +739,7 @@ static bool canEmitInitWithFewStoresAfterMemset(llvm::Constant *Init,
+     }
+     return true;
+   }
+-  
++
+   if (llvm::ConstantDataSequential *CDS =
+         dyn_cast<llvm::ConstantDataSequential>(Init)) {
+     for (unsigned i = 0, e = CDS->getNumElements(); i != e; ++i) {
+@@ -753,8 +768,8 @@ static void emitStoresForInitAfterMemset(llvm::Constant *Init, llvm::Value *Loc,
+     Builder.CreateStore(Init, Loc, isVolatile);
+     return;
+   }
+-  
+-  if (llvm::ConstantDataSequential *CDS = 
++
++  if (llvm::ConstantDataSequential *CDS =
+         dyn_cast<llvm::ConstantDataSequential>(Init)) {
+     for (unsigned i = 0, e = CDS->getNumElements(); i != e; ++i) {
+       llvm::Constant *Elt = CDS->getElementAsConstant(i);
+@@ -1137,6 +1152,12 @@ void CodeGenFunction::EmitAutoVarInit(const AutoVarEmission &emission) {
+     GV->setAlignment(alignment.getQuantity());
+     GV->setUnnamedAddr(true);
+ 
++    if(D.hasAttr<PrivilegeSeparationAttr>()) {
++        PrivilegeSeparationAttr *PSA = D.getAttr<PrivilegeSeparationAttr>();
++        uint32_t pl = PSA->getPrivilegeLevel();
++        GV->setPrivilegeSeparation(pl);
++    }
++
+     llvm::Value *SrcPtr = GV;
+     if (SrcPtr->getType() != BP)
+       SrcPtr = Builder.CreateBitCast(SrcPtr, BP);
+diff --git a/lib/CodeGen/CodeGenModule.cpp b/lib/CodeGen/CodeGenModule.cpp
+index 48823be..b7e8168 100644
+--- a/lib/CodeGen/CodeGenModule.cpp
++++ b/lib/CodeGen/CodeGenModule.cpp
+@@ -51,7 +51,7 @@
+ #include "llvm/ProfileData/InstrProfReader.h"
+ #include "llvm/Support/ConvertUTF.h"
+ #include "llvm/Support/ErrorHandling.h"
+-
++#include <sstream>
+ using namespace clang;
+ using namespace CodeGen;
+ 
+@@ -561,7 +561,7 @@ StringRef CodeGenModule::getBlockMangledName(GlobalDecl GD,
+   SmallString<256> Buffer;
+   llvm::raw_svector_ostream Out(Buffer);
+   if (!D)
+-    MangleCtx.mangleGlobalBlock(BD, 
++    MangleCtx.mangleGlobalBlock(BD,
+       dyn_cast_or_null<VarDecl>(initializedGlobalDecl.getDecl()), Out);
+   else if (const auto *CD = dyn_cast<CXXConstructorDecl>(D))
+     MangleCtx.mangleCtorBlock(CD, GD.getCtorType(), BD, Out);
+@@ -711,7 +711,13 @@ void CodeGenModule::SetLLVMFunctionAttributesForDefinition(const Decl *D,
+     B.addAttribute(llvm::Attribute::OptimizeForSize);
+     B.addAttribute(llvm::Attribute::Cold);
+   }
+-
++  if (D->hasAttr<PrivilegeSeparationAttr>()) {
++    PrivilegeSeparationAttr *PSA = D->getAttr<PrivilegeSeparationAttr>();
++    uint32_t pl = PSA->getPrivilegeLevel();
++    std::stringstream ss;
++    ss << pl;
++    B.addAttribute("privilege-separation",ss.str());
++  }
+   if (D->hasAttr<MinSizeAttr>())
+     B.addAttribute(llvm::Attribute::MinSize);
+ 
+@@ -812,6 +818,11 @@ static void setLinkageAndVisibilityForGV(llvm::GlobalValue *GV,
+       GV->setLinkage(llvm::GlobalValue::ExternalWeakLinkage);
+     }
+ 
++    if (ND->hasAttr<PrivilegeSeparationAttr>()) {
++        PrivilegeSeparationAttr *PSA = ND->getAttr<PrivilegeSeparationAttr>();
++        uint32_t pl = PSA->getPrivilegeLevel();
++        GV->setPrivilegeSeparation(pl);
++    }
+     // Set visibility on a declaration only if it's explicit.
+     if (LV.isVisibilityExplicit())
+       GV->setVisibility(CodeGenModule::GetLLVMVisibility(LV.getVisibility()));
+@@ -1276,7 +1287,7 @@ void CodeGenModule::EmitGlobal(GlobalDecl GD) {
+     DelayedCXXInitPosition[Global] = CXXGlobalInits.size();
+     CXXGlobalInits.push_back(nullptr);
+   }
+-  
++
+   // If the value has already been used, add it directly to the
+   // DeferredDeclsToEmit list.
+   StringRef MangledName = getMangledName(GD);
+@@ -1379,12 +1390,12 @@ void CodeGenModule::CompleteDIClassType(const CXXMethodDecl* D) {
+ void CodeGenModule::EmitGlobalDefinition(GlobalDecl GD, llvm::GlobalValue *GV) {
+   const auto *D = cast<ValueDecl>(GD.getDecl());
+ 
+-  PrettyStackTraceDecl CrashInfo(const_cast<ValueDecl *>(D), D->getLocation(), 
++  PrettyStackTraceDecl CrashInfo(const_cast<ValueDecl *>(D), D->getLocation(),
+                                  Context.getSourceManager(),
+                                  "Generating code for declaration");
+-  
++
+   if (isa<FunctionDecl>(D)) {
+-    // At -O0, don't generate IR for functions with available_externally 
++    // At -O0, don't generate IR for functions with available_externally
+     // linkage.
+     if (!shouldEmitFunction(GD))
+       return;
+@@ -1411,7 +1422,7 @@ void CodeGenModule::EmitGlobalDefinition(GlobalDecl GD, llvm::GlobalValue *GV) {
+ 
+   if (const auto *VD = dyn_cast<VarDecl>(D))
+     return EmitGlobalVarDefinition(VD);
+-  
++
+   llvm_unreachable("Invalid argument to EmitGlobalDefinition()");
+ }
+ 
+@@ -1458,7 +1469,7 @@ CodeGenModule::GetOrCreateLLVMFunction(StringRef MangledName,
+     FTy = llvm::FunctionType::get(VoidTy, false);
+     IsIncompleteFunction = true;
+   }
+-  
++
+   llvm::Function *F = llvm::Function::Create(FTy,
+                                              llvm::Function::ExternalLinkage,
+                                              MangledName, &getModule());
+@@ -1553,7 +1564,7 @@ llvm::Constant *CodeGenModule::GetAddrOfFunction(GlobalDecl GD,
+   // If there was no specific requested type, just convert it now.
+   if (!Ty)
+     Ty = getTypes().ConvertType(cast<ValueDecl>(GD.getDecl())->getType());
+-  
++
+   StringRef MangledName = getMangledName(GD);
+   return GetOrCreateLLVMFunction(MangledName, Ty, GD, ForVTable, DontDefer);
+ }
+@@ -1652,6 +1663,11 @@ CodeGenModule::GetOrCreateLLVMGlobal(StringRef MangledName,
+         CXXThreadLocals.push_back(std::make_pair(D, GV));
+       setTLSMode(GV, *D);
+     }
++    if(D->hasAttr<PrivilegeSeparationAttr>()) {
++        PrivilegeSeparationAttr *PSA = D->getAttr<PrivilegeSeparationAttr>();
++        uint32_t pl = PSA->getPrivilegeLevel();
++        GV->setPrivilegeSeparation(pl);
++    }
+ 
+     // If required by the ABI, treat declarations of static data members with
+     // inline initializers as definitions.
+@@ -1675,7 +1691,7 @@ CodeGenModule::GetOrCreateLLVMGlobal(StringRef MangledName,
+ 
+ 
+ llvm::GlobalVariable *
+-CodeGenModule::CreateOrReplaceCXXRuntimeVariable(StringRef Name, 
++CodeGenModule::CreateOrReplaceCXXRuntimeVariable(StringRef Name,
+                                       llvm::Type *Ty,
+                                       llvm::GlobalValue::LinkageTypes Linkage) {
+   llvm::GlobalVariable *GV = getModule().getNamedGlobal(Name);
+@@ -1691,7 +1707,7 @@ CodeGenModule::CreateOrReplaceCXXRuntimeVariable(StringRef Name,
+     assert(GV->isDeclaration() && "Declaration has wrong type!");
+     OldGV = GV;
+   }
+-  
++
+   // Create a new variable.
+   GV = new llvm::GlobalVariable(getModule(), Ty, /*isConstant=*/true,
+                                 Linkage, nullptr, Name);
+@@ -1699,16 +1715,16 @@ CodeGenModule::CreateOrReplaceCXXRuntimeVariable(StringRef Name,
+   if (OldGV) {
+     // Replace occurrences of the old variable if needed.
+     GV->takeName(OldGV);
+-    
++
+     if (!OldGV->use_empty()) {
+       llvm::Constant *NewPtrForOldDecl =
+       llvm::ConstantExpr::getBitCast(GV, OldGV->getType());
+       OldGV->replaceAllUsesWith(NewPtrForOldDecl);
+     }
+-    
++
+     OldGV->eraseFromParent();
+   }
+-  
++
+   return GV;
+ }
+ 
+@@ -2476,7 +2492,7 @@ CodeGenModule::GetAddrOfConstantCFString(const StringLiteral *Literal) {
+   llvm::Constant *Zero = llvm::Constant::getNullValue(Int32Ty);
+   llvm::Constant *Zeros[] = { Zero, Zero };
+   llvm::Value *V;
+-  
++
+   // If we don't already have it, get __CFConstantStringClassReference.
+   if (!CFConstantStringClassRef) {
+     llvm::Type *Ty = getTypes().ConvertType(getContext().IntTy);
+@@ -2564,10 +2580,10 @@ CodeGenModule::GetAddrOfConstantString(const StringLiteral *Literal) {
+   unsigned StringLength = 0;
+   llvm::StringMapEntry<llvm::Constant*> &Entry =
+     GetConstantStringEntry(CFConstantStringMap, Literal, StringLength);
+-  
++
+   if (llvm::Constant *C = Entry.getValue())
+     return C;
+-  
++
+   llvm::Constant *Zero = llvm::Constant::getNullValue(Int32Ty);
+   llvm::Constant *Zeros[] = { Zero, Zero };
+   llvm::Value *V;
+@@ -2577,8 +2593,8 @@ CodeGenModule::GetAddrOfConstantString(const StringLiteral *Literal) {
+     llvm::Type *Ty = getTypes().ConvertType(getContext().IntTy);
+     llvm::Constant *GV;
+     if (LangOpts.ObjCRuntime.isNonFragile()) {
+-      std::string str = 
+-        StringClass.empty() ? "OBJC_CLASS_$_NSConstantString" 
++      std::string str =
++        StringClass.empty() ? "OBJC_CLASS_$_NSConstantString"
+                             : "OBJC_CLASS_$_" + StringClass;
+       GV = getObjCRuntime().GetClassGlobal(str);
+       // Make sure the result is of the correct type.
+@@ -2603,16 +2619,16 @@ CodeGenModule::GetAddrOfConstantString(const StringLiteral *Literal) {
+     // Construct the type for a constant NSString.
+     RecordDecl *D = Context.buildImplicitRecord("__builtin_NSString");
+     D->startDefinition();
+-      
++
+     QualType FieldTypes[3];
+-    
++
+     // const int *isa;
+     FieldTypes[0] = Context.getPointerType(Context.IntTy.withConst());
+     // const char *str;
+     FieldTypes[1] = Context.getPointerType(Context.CharTy.withConst());
+     // unsigned int length;
+     FieldTypes[2] = Context.UnsignedIntTy;
+-    
++
+     // Create fields
+     for (unsigned i = 0; i < 3; ++i) {
+       FieldDecl *Field = FieldDecl::Create(Context, D,
+@@ -2625,21 +2641,21 @@ CodeGenModule::GetAddrOfConstantString(const StringLiteral *Literal) {
+       Field->setAccess(AS_public);
+       D->addDecl(Field);
+     }
+-    
++
+     D->completeDefinition();
+     QualType NSTy = Context.getTagDeclType(D);
+     NSConstantStringType = cast<llvm::StructType>(getTypes().ConvertType(NSTy));
+   }
+-  
++
+   llvm::Constant *Fields[3];
+-  
++
+   // Class pointer.
+   Fields[0] = cast<llvm::ConstantExpr>(V);
+-  
++
+   // String pointer.
+   llvm::Constant *C =
+     llvm::ConstantDataArray::getString(VMContext, Entry.getKey());
+-  
++
+   llvm::GlobalValue::LinkageTypes Linkage;
+   bool isConstant;
+   Linkage = llvm::GlobalValue::PrivateLinkage;
+@@ -2653,11 +2669,11 @@ CodeGenModule::GetAddrOfConstantString(const StringLiteral *Literal) {
+   CharUnits Align = getContext().getTypeAlignInChars(getContext().CharTy);
+   GV->setAlignment(Align.getQuantity());
+   Fields[1] = llvm::ConstantExpr::getGetElementPtr(GV, Zeros);
+-  
++
+   // String length.
+   llvm::Type *Ty = getTypes().ConvertType(getContext().UnsignedIntTy);
+   Fields[2] = llvm::ConstantInt::get(Ty, StringLength);
+-  
++
+   // The struct.
+   C = llvm::ConstantStruct::get(NSConstantStringType, Fields);
+   GV = new llvm::GlobalVariable(getModule(), C->getType(), true,
+@@ -2671,7 +2687,7 @@ CodeGenModule::GetAddrOfConstantString(const StringLiteral *Literal) {
+                      ? NSStringNonFragileABISection
+                      : NSStringSection);
+   Entry.setValue(GV);
+-  
++
+   return GV;
+ }
+ 
+@@ -2679,7 +2695,7 @@ QualType CodeGenModule::getObjCFastEnumerationStateType() {
+   if (ObjCFastEnumerationStateType.isNull()) {
+     RecordDecl *D = Context.buildImplicitRecord("__objcFastEnumerationState");
+     D->startDefinition();
+-    
++
+     QualType FieldTypes[] = {
+       Context.UnsignedLongTy,
+       Context.getPointerType(Context.getObjCIdType()),
+@@ -2687,7 +2703,7 @@ QualType CodeGenModule::getObjCFastEnumerationStateType() {
+       Context.getConstantArrayType(Context.UnsignedLongTy,
+                            llvm::APInt(32, 5), ArrayType::Normal, 0)
+     };
+-    
++
+     for (size_t i = 0; i < 4; ++i) {
+       FieldDecl *Field = FieldDecl::Create(Context,
+                                            D,
+@@ -2700,18 +2716,18 @@ QualType CodeGenModule::getObjCFastEnumerationStateType() {
+       Field->setAccess(AS_public);
+       D->addDecl(Field);
+     }
+-    
++
+     D->completeDefinition();
+     ObjCFastEnumerationStateType = Context.getTagDeclType(D);
+   }
+-  
++
+   return ObjCFastEnumerationStateType;
+ }
+ 
+ llvm::Constant *
+ CodeGenModule::GetConstantArrayFromStringLiteral(const StringLiteral *E) {
+   assert(!E->getType()->isPointerType() && "Strings are always arrays");
+-  
++
+   // Don't emit it as the address of the string, emit the string data itself
+   // as an inline array.
+   if (E->getCharByteWidth() == 1) {
+@@ -2737,11 +2753,11 @@ CodeGenModule::GetConstantArrayFromStringLiteral(const StringLiteral *E) {
+     Elements.resize(NumElements);
+     return llvm::ConstantDataArray::get(VMContext, Elements);
+   }
+-  
++
+   assert(ElemTy->getPrimitiveSizeInBits() == 32);
+   SmallVector<uint32_t, 32> Elements;
+   Elements.reserve(NumElements);
+-  
++
+   for(unsigned i = 0, e = E->getLength(); i != e; ++i)
+     Elements.push_back(E->getCodeUnit(i));
+   Elements.resize(NumElements);
+@@ -2994,11 +3010,11 @@ void CodeGenModule::EmitObjCIvarInitializations(ObjCImplementationDecl *D) {
+   // a .cxx_construct.
+   if (D->getNumIvarInitializers() == 0)
+     return;
+-  
++
+   IdentifierInfo *II = &getContext().Idents.get(".cxx_construct");
+   Selector cxxSelector = getContext().Selectors.getSelector(0, &II);
+   // The constructor returns 'self'.
+-  ObjCMethodDecl *CTORMethod = ObjCMethodDecl::Create(getContext(), 
++  ObjCMethodDecl *CTORMethod = ObjCMethodDecl::Create(getContext(),
+                                                 D->getLocation(),
+                                                 D->getLocation(),
+                                                 cxxSelector,
+@@ -3106,7 +3122,7 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
+     if (cast<FunctionDecl>(D)->getDescribedFunctionTemplate() ||
+         cast<FunctionDecl>(D)->isLateTemplateParsed())
+       return;
+-      
++
+     getCXXABI().EmitCXXConstructors(cast<CXXConstructorDecl>(D));
+     break;
+   case Decl::CXXDestructor:
+@@ -3132,7 +3148,7 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
+       ObjCRuntime->GenerateProtocol(Proto);
+     break;
+   }
+-      
++
+   case Decl::ObjCCategoryImpl:
+     // Categories have properties but don't support synthesize so we
+     // can ignore them here.
+@@ -3371,7 +3387,7 @@ llvm::Constant *CodeGenModule::GetAddrOfRTTIDescriptor(QualType Ty,
+   // and it's not for EH?
+   if (!ForEH && !getLangOpts().RTTI)
+     return llvm::Constant::getNullValue(Int8PtrTy);
+-  
++
+   if (ForEH && Ty->isObjCObjectPointerType() &&
+       LangOpts.ObjCRuntime.isGNUFamily())
+     return ObjCRuntime->GetEHType(Ty);
+diff --git a/lib/Sema/SemaDeclAttr.cpp b/lib/Sema/SemaDeclAttr.cpp
+index 61683cd..0ac8d5e 100644
+--- a/lib/Sema/SemaDeclAttr.cpp
++++ b/lib/Sema/SemaDeclAttr.cpp
+@@ -29,6 +29,7 @@
+ #include "clang/Sema/Lookup.h"
+ #include "clang/Sema/Scope.h"
+ #include "llvm/ADT/StringExtras.h"
++#include "llvm/Transforms/PrivilegeSeparation.h"
+ using namespace clang;
+ using namespace sema;
+ 
+@@ -789,7 +790,7 @@ static void handleConsumableAttr(Sema &S, Decl *D, const AttributeList &Attr) {
+         << Attr.getName() << AANT_ArgumentIdentifier;
+     return;
+   }
+-  
++
+   D->addAttr(::new (S.Context)
+              ConsumableAttr(Attr.getRange(), S.Context, DefaultState,
+                             Attr.getAttributeSpellingListIndex()));
+@@ -800,16 +801,16 @@ static bool checkForConsumableClass(Sema &S, const CXXMethodDecl *MD,
+                                         const AttributeList &Attr) {
+   ASTContext &CurrContext = S.getASTContext();
+   QualType ThisType = MD->getThisType(CurrContext)->getPointeeType();
+-  
++
+   if (const CXXRecordDecl *RD = ThisType->getAsCXXRecordDecl()) {
+     if (!RD->hasAttr<ConsumableAttr>()) {
+       S.Diag(Attr.getLoc(), diag::warn_attr_on_unconsumable_class) <<
+         RD->getNameAsString();
+-      
++
+       return false;
+     }
+   }
+-  
++
+   return true;
+ }
+ 
+@@ -818,14 +819,14 @@ static void handleCallableWhenAttr(Sema &S, Decl *D,
+                                    const AttributeList &Attr) {
+   if (!checkAttributeAtLeastNumArgs(S, Attr, 1))
+     return;
+-  
++
+   if (!checkForConsumableClass(S, cast<CXXMethodDecl>(D), Attr))
+     return;
+-  
++
+   SmallVector<CallableWhenAttr::ConsumedState, 3> States;
+   for (unsigned ArgIndex = 0; ArgIndex < Attr.getNumArgs(); ++ArgIndex) {
+     CallableWhenAttr::ConsumedState CallableState;
+-    
++
+     StringRef StateString;
+     SourceLocation Loc;
+     if (!S.checkStringLiteralArgumentAttr(Attr, ArgIndex, StateString, &Loc))
+@@ -837,10 +838,10 @@ static void handleCallableWhenAttr(Sema &S, Decl *D,
+         << Attr.getName() << StateString;
+       return;
+     }
+-      
++
+     States.push_back(CallableState);
+   }
+-  
++
+   D->addAttr(::new (S.Context)
+              CallableWhenAttr(Attr.getRange(), S.Context, States.data(),
+                States.size(), Attr.getAttributeSpellingListIndex()));
+@@ -850,9 +851,9 @@ static void handleCallableWhenAttr(Sema &S, Decl *D,
+ static void handleParamTypestateAttr(Sema &S, Decl *D,
+                                     const AttributeList &Attr) {
+   if (!checkAttributeNumArgs(S, Attr, 1)) return;
+-    
++
+   ParamTypestateAttr::ConsumedState ParamState;
+-  
++
+   if (Attr.isArgIdent(0)) {
+     IdentifierLoc *Ident = Attr.getArgAsIdent(0);
+     StringRef StateString = Ident->Ident->getName();
+@@ -868,7 +869,7 @@ static void handleParamTypestateAttr(Sema &S, Decl *D,
+       Attr.getName() << AANT_ArgumentIdentifier;
+     return;
+   }
+-  
++
+   // FIXME: This check is currently being done in the analysis.  It can be
+   //        enabled here only after the parser propagates attributes at
+   //        template specialization definition, not declaration.
+@@ -880,7 +881,7 @@ static void handleParamTypestateAttr(Sema &S, Decl *D,
+   //      ReturnType.getAsString();
+   //    return;
+   //}
+-  
++
+   D->addAttr(::new (S.Context)
+              ParamTypestateAttr(Attr.getRange(), S.Context, ParamState,
+                                 Attr.getAttributeSpellingListIndex()));
+@@ -890,9 +891,9 @@ static void handleParamTypestateAttr(Sema &S, Decl *D,
+ static void handleReturnTypestateAttr(Sema &S, Decl *D,
+                                       const AttributeList &Attr) {
+   if (!checkAttributeNumArgs(S, Attr, 1)) return;
+-  
++
+   ReturnTypestateAttr::ConsumedState ReturnState;
+-  
++
+   if (Attr.isArgIdent(0)) {
+     IdentifierLoc *IL = Attr.getArgAsIdent(0);
+     if (!ReturnTypestateAttr::ConvertStrToConsumedState(IL->Ident->getName(),
+@@ -906,7 +907,7 @@ static void handleReturnTypestateAttr(Sema &S, Decl *D,
+       Attr.getName() << AANT_ArgumentIdentifier;
+     return;
+   }
+-  
++
+   // FIXME: This check is currently being done in the analysis.  It can be
+   //        enabled here only after the parser propagates attributes at
+   //        template specialization definition, not declaration.
+@@ -918,9 +919,9 @@ static void handleReturnTypestateAttr(Sema &S, Decl *D,
+   //} else if (const CXXConstructorDecl *Constructor =
+   //             dyn_cast<CXXConstructorDecl>(D)) {
+   //  ReturnType = Constructor->getThisType(S.getASTContext())->getPointeeType();
+-  //  
++  //
+   //} else {
+-  //  
++  //
+   //  ReturnType = cast<FunctionDecl>(D)->getCallResultType();
+   //}
+   //
+@@ -931,7 +932,7 @@ static void handleReturnTypestateAttr(Sema &S, Decl *D,
+   //      ReturnType.getAsString();
+   //    return;
+   //}
+-  
++
+   D->addAttr(::new (S.Context)
+              ReturnTypestateAttr(Attr.getRange(), S.Context, ReturnState,
+                                  Attr.getAttributeSpellingListIndex()));
+@@ -941,10 +942,10 @@ static void handleReturnTypestateAttr(Sema &S, Decl *D,
+ static void handleSetTypestateAttr(Sema &S, Decl *D, const AttributeList &Attr) {
+   if (!checkAttributeNumArgs(S, Attr, 1))
+     return;
+-  
++
+   if (!checkForConsumableClass(S, cast<CXXMethodDecl>(D), Attr))
+     return;
+-  
++
+   SetTypestateAttr::ConsumedState NewState;
+   if (Attr.isArgIdent(0)) {
+     IdentifierLoc *Ident = Attr.getArgAsIdent(0);
+@@ -959,7 +960,7 @@ static void handleSetTypestateAttr(Sema &S, Decl *D, const AttributeList &Attr)
+       Attr.getName() << AANT_ArgumentIdentifier;
+     return;
+   }
+-  
++
+   D->addAttr(::new (S.Context)
+              SetTypestateAttr(Attr.getRange(), S.Context, NewState,
+                               Attr.getAttributeSpellingListIndex()));
+@@ -969,11 +970,11 @@ static void handleTestTypestateAttr(Sema &S, Decl *D,
+                                     const AttributeList &Attr) {
+   if (!checkAttributeNumArgs(S, Attr, 1))
+     return;
+-  
++
+   if (!checkForConsumableClass(S, cast<CXXMethodDecl>(D), Attr))
+     return;
+-  
+-  TestTypestateAttr::ConsumedState TestState;  
++
++  TestTypestateAttr::ConsumedState TestState;
+   if (Attr.isArgIdent(0)) {
+     IdentifierLoc *Ident = Attr.getArgAsIdent(0);
+     StringRef Param = Ident->Ident->getName();
+@@ -987,7 +988,7 @@ static void handleTestTypestateAttr(Sema &S, Decl *D,
+       Attr.getName() << AANT_ArgumentIdentifier;
+     return;
+   }
+-  
++
+   D->addAttr(::new (S.Context)
+              TestTypestateAttr(Attr.getRange(), S.Context, TestState,
+                                 Attr.getAttributeSpellingListIndex()));
+@@ -1475,7 +1476,7 @@ bool Sema::CheckNoReturnAttr(const AttributeList &attr) {
+ 
+ static void handleAnalyzerNoReturnAttr(Sema &S, Decl *D,
+                                        const AttributeList &Attr) {
+-  
++
+   // The checking path for 'noreturn' and 'analyzer_noreturn' are different
+   // because 'analyzer_noreturn' does not impact the type.
+   if (!isFunctionOrMethod(D) && !isa<BlockDecl>(D)) {
+@@ -1489,7 +1490,7 @@ static void handleAnalyzerNoReturnAttr(Sema &S, Decl *D,
+       return;
+     }
+   }
+-  
++
+   D->addAttr(::new (S.Context)
+              AnalyzerNoReturnAttr(Attr.getRange(), S.Context,
+                                   Attr.getAttributeSpellingListIndex()));
+@@ -1499,20 +1500,20 @@ static void handleAnalyzerNoReturnAttr(Sema &S, Decl *D,
+ static void handleVecReturnAttr(Sema &S, Decl *D, const AttributeList &Attr) {
+ /*
+   Returning a Vector Class in Registers
+-  
+-  According to the PPU ABI specifications, a class with a single member of 
++
++  According to the PPU ABI specifications, a class with a single member of
+   vector type is returned in memory when used as the return value of a function.
+   This results in inefficient code when implementing vector classes. To return
+   the value in a single vector register, add the vecreturn attribute to the
+   class definition. This attribute is also applicable to struct types.
+-  
++
+   Example:
+-  
++
+   struct Vector
+   {
+     __vector float xyzw;
+   } __attribute__((vecreturn));
+-  
++
+   Vector Add(Vector lhs, Vector rhs)
+   {
+     Vector result;
+@@ -1841,7 +1842,7 @@ static void handleAvailabilityAttr(Sema &S, Decl *D,
+     return;
+   IdentifierLoc *Platform = Attr.getArgAsIdent(0);
+   unsigned Index = Attr.getAttributeSpellingListIndex();
+-  
++
+   IdentifierInfo *II = Platform->Ident;
+   if (AvailabilityAttr::getPrettyPlatformName(II->getName()).empty())
+     S.Diag(Platform->Loc, diag::warn_availability_unknown_platform)
+@@ -1934,7 +1935,7 @@ static void handleVisibilityAttr(Sema &S, Decl *D, const AttributeList &Attr,
+       << Attr.getName() << TypeStr;
+     return;
+   }
+-  
++
+   // Complain about attempts to use protected visibility on targets
+   // (like Darwin) that don't support it.
+   if (type == VisibilityAttr::Protected &&
+@@ -2007,7 +2008,7 @@ static void handleObjCNSObject(Sema &S, Decl *D, const AttributeList &Attr) {
+     //  @property (retain, nonatomic) struct Bork *Q __attribute__((NSObject));
+     //
+     // In this case it follows tradition and suppresses an error in the above
+-    // case.    
++    // case.
+     S.Diag(D->getLocation(), diag::warn_nsobject_attribute);
+   }
+   D->addAttr(::new (S.Context)
+@@ -2146,8 +2147,8 @@ static void handleWarnUnusedResult(Sema &S, Decl *D, const AttributeList &Attr)
+       << Attr.getName() << 1;
+       return;
+     }
+-  
+-  D->addAttr(::new (S.Context) 
++
++  D->addAttr(::new (S.Context)
+              WarnUnusedResultAttr(Attr.getRange(), S.Context,
+                                   Attr.getAttributeSpellingListIndex()));
+ }
+@@ -2413,7 +2414,7 @@ static void handleInitPriorityAttr(Sema &S, Decl *D,
+     S.Diag(Attr.getLoc(), diag::warn_attribute_ignored) << Attr.getName();
+     return;
+   }
+-  
++
+   if (S.getCurFunctionOrMethodDecl()) {
+     S.Diag(Attr.getLoc(), diag::err_init_priority_object_attr);
+     Attr.setInvalid();
+@@ -2493,10 +2494,10 @@ static void handleFormatAttr(Sema &S, Decl *D, const AttributeList &Attr) {
+ 
+   // Check for supported formats.
+   FormatAttrKind Kind = getFormatAttrKind(Format);
+-  
++
+   if (Kind == IgnoredFormat)
+     return;
+-  
++
+   if (Kind == InvalidFormat) {
+     S.Diag(Attr.getLoc(), diag::warn_attribute_type_not_supported)
+       << Attr.getName() << II->getName();
+@@ -2673,7 +2674,7 @@ static void handleAnnotateAttr(Sema &S, Decl *D, const AttributeList &Attr) {
+     if (I->getAnnotation() == Str)
+       return;
+   }
+-  
++
+   D->addAttr(::new (S.Context)
+              AnnotateAttr(Attr.getRange(), S.Context, Str,
+                           Attr.getAttributeSpellingListIndex()));
+@@ -2879,7 +2880,7 @@ static void handleModeAttr(Sema &S, Decl *D, const AttributeList &Attr) {
+       << AANT_ArgumentIdentifier;
+     return;
+   }
+-  
++
+   IdentifierInfo *Name = Attr.getArgAsIdent(0)->Ident;
+   StringRef Str = Name->getName();
+ 
+@@ -3140,7 +3141,7 @@ static void handleCallConvAttr(Sema &S, Decl *D, const AttributeList &Attr) {
+   }
+ }
+ 
+-bool Sema::CheckCallingConvAttr(const AttributeList &attr, CallingConv &CC, 
++bool Sema::CheckCallingConvAttr(const AttributeList &attr, CallingConv &CC,
+                                 const FunctionDecl *FD) {
+   if (attr.isInvalid())
+     return true;
+@@ -3196,7 +3197,7 @@ bool Sema::CheckCallingConvAttr(const AttributeList &attr, CallingConv &CC,
+ 
+     TargetInfo::CallingConvMethodType MT = TargetInfo::CCMT_Unknown;
+     if (FD)
+-      MT = FD->isCXXInstanceMember() ? TargetInfo::CCMT_Member : 
++      MT = FD->isCXXInstanceMember() ? TargetInfo::CCMT_Member :
+                                     TargetInfo::CCMT_NonMember;
+     CC = TI.getDefaultCallingConv(MT);
+   }
+@@ -3271,7 +3272,7 @@ static void handleArgumentWithTypeTagAttr(Sema &S, Decl *D,
+       << Attr.getName() << /* arg num = */ 1 << AANT_ArgumentIdentifier;
+     return;
+   }
+-  
++
+   if (!checkAttributeNumArgs(S, Attr, 3))
+     return;
+ 
+@@ -3316,7 +3317,7 @@ static void handleTypeTagForDatatypeAttr(Sema &S, Decl *D,
+       << Attr.getName() << 1 << AANT_ArgumentIdentifier;
+     return;
+   }
+-  
++
+   if (!checkAttributeNumArgs(S, Attr, 1))
+     return;
+ 
+@@ -3349,13 +3350,13 @@ static bool isValidSubjectOfNSReturnsRetainedAttribute(QualType type) {
+ }
+ 
+ static bool isValidSubjectOfNSAttribute(Sema &S, QualType type) {
+-  return type->isDependentType() || 
+-         type->isObjCObjectPointerType() || 
++  return type->isDependentType() ||
++         type->isObjCObjectPointerType() ||
+          S.Context.isObjCNSObjectType(type);
+ }
+ static bool isValidSubjectOfCFAttribute(Sema &S, QualType type) {
+-  return type->isDependentType() || 
+-         type->isPointerType() || 
++  return type->isDependentType() ||
++         type->isPointerType() ||
+          isValidSubjectOfNSAttribute(S, type);
+ }
+ 
+@@ -3416,7 +3417,7 @@ static void handleNSReturnsRetainedAttr(Sema &S, Decl *D,
+     typeOK = isValidSubjectOfNSReturnsRetainedAttribute(returnType);
+     cf = false;
+     break;
+-      
++
+   case AttributeList::AT_NSReturnsAutoreleased:
+   case AttributeList::AT_NSReturnsNotRetained:
+     typeOK = isValidSubjectOfNSAttribute(S, returnType);
+@@ -3471,7 +3472,7 @@ static void handleObjCReturnsInnerPointerAttr(Sema &S, Decl *D,
+                                               const AttributeList &attr) {
+   const int EP_ObjCMethod = 1;
+   const int EP_ObjCProperty = 2;
+-  
++
+   SourceLocation loc = attr.getLoc();
+   QualType resultType;
+   if (isa<ObjCMethodDecl>(D))
+@@ -3499,7 +3500,7 @@ static void handleObjCReturnsInnerPointerAttr(Sema &S, Decl *D,
+ static void handleObjCRequiresSuperAttr(Sema &S, Decl *D,
+                                         const AttributeList &attr) {
+   ObjCMethodDecl *method = cast<ObjCMethodDecl>(D);
+-  
++
+   DeclContext *DC = method->getDeclContext();
+   if (const ObjCProtocolDecl *PDecl = dyn_cast_or_null<ObjCProtocolDecl>(DC)) {
+     S.Diag(D->getLocStart(), diag::warn_objc_requires_super_protocol)
+@@ -3512,7 +3513,7 @@ static void handleObjCRequiresSuperAttr(Sema &S, Decl *D,
+     << attr.getName() << 1;
+     return;
+   }
+-  
++
+   method->addAttr(::new (S.Context)
+                   ObjCRequiresSuperAttr(attr.getRange(), S.Context,
+                                         attr.getAttributeSpellingListIndex()));
+@@ -3546,7 +3547,7 @@ static void handleObjCBridgeAttr(Sema &S, Scope *Sc, Decl *D,
+     S.Diag(D->getLocStart(), diag::err_objc_attr_not_id) << Attr.getName() << 0;
+     return;
+   }
+-  
++
+   D->addAttr(::new (S.Context)
+              ObjCBridgeAttr(Attr.getRange(), S.Context, Parm->Ident,
+                            Attr.getAttributeSpellingListIndex()));
+@@ -3560,7 +3561,7 @@ static void handleObjCBridgeMutableAttr(Sema &S, Scope *Sc, Decl *D,
+     S.Diag(D->getLocStart(), diag::err_objc_attr_not_id) << Attr.getName() << 0;
+     return;
+   }
+-  
++
+   D->addAttr(::new (S.Context)
+              ObjCBridgeMutableAttr(Attr.getRange(), S.Context, Parm->Ident,
+                             Attr.getAttributeSpellingListIndex()));
+@@ -3776,7 +3777,7 @@ static void handleMSP430InterruptAttr(Sema &S, Decl *D,
+   if (!Attr.isArgExpr(0)) {
+     S.Diag(Attr.getLoc(), diag::err_attribute_argument_type) << Attr.getName()
+       << AANT_ArgumentIntegerConstant;
+-    return;    
++    return;
+   }
+ 
+   // FIXME: Check for decl - it should be void ()(void).
+@@ -4033,6 +4034,33 @@ static bool handleCommonAttributeFeatures(Sema &S, Scope *scope, Decl *D,
+   return false;
+ }
+ 
++static void handlePrivilegeSeparation(Sema &S, Decl *D,
++        const AttributeList &Attr) {
++    if (Attr.getNumArgs() > 1) {
++        S.Diag(Attr.getLoc(), diag::err_attribute_too_many_arguments)
++            << Attr.getName() << 1;
++        return;
++    }
++    if (Attr.getNumArgs() == 0) {
++        S.Diag(Attr.getLoc(), diag::err_attribute_too_few_arguments)
++            << Attr.getName() << 1;
++        return;
++    }
++    uint32_t privilegeLevel;
++    if (!checkUInt32Argument(S, Attr, Attr.getArgAsExpr(0), privilegeLevel, 1))
++        return;
++    if (privilegeLevel >= NUM_OF_LEVELS) {
++         S.Diag(Attr.getLoc(), diag::err_attribute_argument_out_of_bounds)
++             << Attr.getName() << 1;
++         return;
++    }
++    D->addAttr(::new (S.Context)
++        PrivilegeSeparationAttr(Attr.getRange(), S.Context,
++                privilegeLevel,
++                Attr.getAttributeSpellingListIndex()));
++}
++
++
+ //===----------------------------------------------------------------------===//
+ // Top Level Sema Entry Points
+ //===----------------------------------------------------------------------===//
+@@ -4260,7 +4288,7 @@ static void ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D,
+   case AttributeList::AT_ObjCRuntimeName:
+     handleObjCRuntimeName(S, D, Attr);
+     break;
+-          
++
+   case AttributeList::AT_CFAuditedTransfer:
+     handleCFAuditedTransferAttr(S, D, Attr);
+     break;
+@@ -4531,6 +4559,10 @@ static void ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D,
+   case AttributeList::AT_TypeTagForDatatype:
+     handleTypeTagForDatatypeAttr(S, D, Attr);
+     break;
++  // PrivilegeSeparation functionality
++  case AttributeList::AT_PrivilegeSeparation:
++    handlePrivilegeSeparation(S, D, Attr);
++    break;
+   }
+ }
+ 
+@@ -4760,9 +4792,9 @@ static void handleDelayedForbiddenType(Sema &S, DelayedDiagnostic &diag,
+   if (S.getLangOpts().ObjCAutoRefCount)
+     if (const FunctionDecl *FD = dyn_cast<FunctionDecl>(decl)) {
+       // FIXME: we may want to suppress diagnostics for all
+-      // kind of forbidden type messages on unavailable functions. 
++      // kind of forbidden type messages on unavailable functions.
+       if (FD->hasAttr<UnavailableAttr>() &&
+-          diag.getForbiddenTypeDiagnostic() == 
++          diag.getForbiddenTypeDiagnostic() ==
+           diag::err_arc_array_param_no_ownership) {
+         diag.Triggered = true;
+         return;

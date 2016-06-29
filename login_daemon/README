@@ -1,0 +1,1 @@
+To allow the daemon to interface correctly with pam copy in the pam directory the file pam_ps_login renaming it as ps_login

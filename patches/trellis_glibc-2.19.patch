@@ -1,0 +1,308 @@
+diff --git a/elf/dl-init.c b/elf/dl-init.c
+index 28a6ff6..45d4c35 100644
+--- a/elf/dl-init.c
++++ b/elf/dl-init.c
+@@ -19,6 +19,7 @@
+ #include <stddef.h>
+ #include <ldsodefs.h>
+ 
++#include "privsep.h"
+ 
+ /* Type of the initializer.  */
+ typedef void (*init_t) (int, char **, char **);
+diff --git a/elf/dl-load.c b/elf/dl-load.c
+index 1be7a3c..6606e4a 100644
+--- a/elf/dl-load.c
++++ b/elf/dl-load.c
+@@ -38,6 +38,11 @@
+ #include <stap-probe.h>
+ 
+ #include <dl-dst.h>
++#include "privsep.h"
++
++struct PrivSec_t *head=NULL, *curr=NULL;
++int max = -1;
++bool ex_flag = false;
+ 
+ /* On some systems, no flag bits are given to specify file mapping.  */
+ #ifndef MAP_FILE
+@@ -908,7 +913,34 @@ lose (int code, int fd, const char *name, char *realname, struct link_map *l,
+ 
+   _dl_signal_error (code, name, NULL, msg);
+ }
++/* Function to convert the privilege level from char to int*/
++int char_to_num( char* pStr )
++{
++  int iRetVal = 0;
+ 
++  if ( pStr )
++  {
++    while ( *pStr && *pStr <= '9' && *pStr >= '0' )
++    {
++      iRetVal = (iRetVal * 10) + (*pStr - '0');
++      pStr++;
++    }
++  }
++  return iRetVal;
++}
++/* Function to compare the first part of the string and see if it matches*/
++int
++_cmp_ps_string (char *str1, const char *str2) {
++	if (*str1 == '\0') return -1;
++        int len2 = strlen(str2);
++	int len1 = strlen(str1);
++	if (len2 > len1) return -1;
++	int i;
++	for (i=0; i<len2; ++i) {
++	  if (*(str1+i) != *(str2+i)) return -1;
++	}
++	return 1;
++}
+ 
+ /* Map in the shared object NAME, actually located in REALNAME, and already
+    opened on FD.  */
+@@ -925,6 +957,9 @@ _dl_map_object_from_fd (const char *name, int fd, struct filebuf *fbp,
+   const ElfW(Ehdr) *header;
+   const ElfW(Phdr) *phdr;
+   const ElfW(Phdr) *ph;
++  const ElfW(Shdr) *shdr;
++  const ElfW(Shdr) *sh;
++  size_t maplengthsh;
+   size_t maplength;
+   int type;
+   struct stat64 st;
+@@ -999,7 +1034,7 @@ _dl_map_object_from_fd (const char *name, int fd, struct filebuf *fbp,
+     }
+ 
+   /* Print debugging message.  */
+-  if (__builtin_expect (GLRO(dl_debug_mask) & DL_DEBUG_FILES, 0))
++    if (__builtin_expect (GLRO(dl_debug_mask) & DL_DEBUG_FILES, 0))
+     _dl_debug_printf ("file=%s [%lu];  generating link map\n", name, nsid);
+ 
+   /* This is the ELF header.  We read it in `open_verify'.  */
+@@ -1065,6 +1100,84 @@ _dl_map_object_from_fd (const char *name, int fd, struct filebuf *fbp,
+       errstring = N_("cannot create shared object descriptor");
+       goto call_lose_errno;
+     }
++  //Get the length of all the section headers
++  maplengthsh = header->e_shnum * sizeof(Elf32_Shdr);
++  //Get the pointer to the beginning of the first section header in the buffer
++  if (header->e_shoff + maplengthsh <= (size_t) fbp->len)
++     shdr = (void *) (fbp->buf + header->e_shoff);
++  else {
++     shdr = alloca(maplengthsh);
++     __lseek(fd, header->e_shoff, SEEK_SET);
++     if ((size_t) __libc_read (fd, (void *) shdr, maplengthsh) != maplengthsh) {
++	errstring = N_("cannot read file data");
++	goto call_lose_errno;
++     }
++  }
++  int counter=0;
++  //Offset of the string table
++  int strndx=0;
++  //Size of the string table
++  int strsiz=0;
++  for (sh = shdr,counter = 0; counter < header->e_shnum ;++counter,++sh) {
++  	if ( counter == header->e_shstrndx) {
++	  //The information are contained in the header number "shstrndx"
++	  strndx = sh->sh_offset;
++	  strsiz = sh->sh_size;
++	}
++  }
++  char* strptr;
++  //Get the pointer to the beginnig of the string table
++  if (strndx+strsiz <= (size_t) fbp->len)
++     strptr = (void *)(fbp->buf + strndx);
++  else {
++     strptr = alloca(strsiz);
++     __lseek(fd, strndx, SEEK_SET);
++     if ((size_t) __libc_read (fd, (void *) strptr, strsiz) != strsiz) {
++	errstring = N_("cannot read file data");
++	goto call_lose_errno;
++     }
++  }
++  //Struct used to map segments and names, the one to be sent to the kernel somehow :)
++  bool flag2 = false;
++  const char *fun = ".fun_ps_";
++  const char *dat = ".dat_ps_";
++  //Construction of the data struct we the mapping information
++  if (!ex_flag) {
++      for (counter =0, sh = shdr; counter < header->e_shnum; ++counter,++sh) {
++        char *name = malloc(sizeof(char)*strlen(strptr+sh->sh_name));
++        strcpy(name, strptr+sh->sh_name);
++        if (*(name) != '\0' ) {
++           if ((_cmp_ps_string(name, fun) == 1) || (_cmp_ps_string(name, dat) == 1)) {
++           //Create a new element in the list if .fun_ps_ or .dat_ps_ section name is detected
++               ex_flag = true;
++               flag2 = true;
++               int num = char_to_num(name+8);
++               if (max < num) max = num;
++               if (head == NULL) {
++                  head = (struct PrivSec_t *) malloc(sizeof(struct PrivSec_t));
++                  head->add_beg = sh->sh_addr;
++                  head->add_end = 0x0;
++                  head->next = NULL;
++                  strcpy((char *)head->name, (const char *)strptr+sh->sh_name);
++                  curr = head;
++               }
++               else {
++                  curr->next = (struct PrivSec_t *) malloc(sizeof(struct PrivSec_t));
++                  if (curr->next == NULL) {
++                errstring = N_("cannot allocate enough memory");
++                goto call_lose_errno;
++                  }
++                  curr = curr->next;
++                  curr->add_beg = sh->sh_addr;
++                  curr->add_end = 0x0;
++                  curr->next = NULL;
++                  strcpy((char *)curr->name, (const char *) strptr+sh->sh_name);
++               }
++           }
++        }
++        free(name);
++    }
++  }
+ 
+   /* Extract the remaining details we need from the ELF header
+      and then read in the program header table.  */
+@@ -1142,10 +1255,14 @@ _dl_map_object_from_fd (const char *name, int fd, struct filebuf *fbp,
+ 	  c->mapstart = ph->p_vaddr & ~(GLRO(dl_pagesize) - 1);
+ 	  c->mapend = ((ph->p_vaddr + ph->p_filesz + GLRO(dl_pagesize) - 1)
+ 		       & ~(GLRO(dl_pagesize) - 1));
++	  //_dl_debug_printf("map start %x \n", c->mapstart);
++	  //_dl_debug_printf("map end %x \n", c->mapend);
++	  //_dl_debug_printf("------------------------\n");
+ 	  c->dataend = ph->p_vaddr + ph->p_filesz;
+ 	  c->allocend = ph->p_vaddr + ph->p_memsz;
+ 	  c->mapoff = ph->p_offset & ~(GLRO(dl_pagesize) - 1);
+ 
++
+ 	  /* Determine whether there is a gap between the last segment
+ 	     and this one.  */
+ 	  if (nloadcmds > 1 && c[-1].mapend != c->mapstart)
+@@ -1270,7 +1387,6 @@ cannot allocate TLS data structures for initial thread");
+ 
+     /* Length of the sections to be loaded.  */
+     maplength = loadcmds[nloadcmds - 1].allocend - c->mapstart;
+-
+     if (__builtin_expect (type, ET_DYN) == ET_DYN)
+       {
+ 	/* This is a position-independent shared object.  We can let the
+@@ -1413,6 +1529,47 @@ cannot allocate TLS data structures for initial thread");
+ 
+ 	++c;
+       }
++      if (flag2) {
++	     curr = head;
++	     /* Basing on the information of the physical headers.
++	      * Here I correct the beginning address and the end address of the data structure */
++	     while (curr != NULL) {
++		struct loadcmd *tmp = loadcmds;
++		Elf32_Addr tmpadd_beg=0;
++		Elf32_Addr tmpadd_end=0;
++		int i;
++		for (i=0; i< nloadcmds; ++i) {
++		   if((tmpadd_beg < tmp[i].mapstart) && (tmp[i].mapstart < curr->add_beg)){
++			tmpadd_beg = tmp[i].mapstart;
++			tmpadd_end = tmp[i].mapend;
++		   }
++		}
++		curr->add_beg = tmpadd_beg;
++		curr->add_end = tmpadd_end;
++		curr = curr->next;
++	     }
++	     	     curr = head;
++	     while (curr != NULL) {
++		if ( max != char_to_num(curr->name+8) ) {
++			if (_cmp_ps_string(curr->name, fun) == 1)
++			{
++			  _dl_debug_printf("PROT_NONE %s %x %x\n", curr->name, curr->add_beg, curr->add_end);
++			  __mprotect ((void *)curr->add_beg,
++			 	(size_t)curr->add_end-curr->add_beg,
++			       PROT_NONE);
++			}
++			else {
++			  _dl_debug_printf("PROT_WRITE %s %x %x\n", curr->name, curr->add_beg, curr->add_end);
++			  __mprotect ((void *)curr->add_beg,
++			 	(size_t)curr->add_end-curr->add_beg,
++			       PROT_NONE);
++			}
++
++		}
++		curr = curr->next;
++	     }
++	 }
++     flag2=false;
+   }
+ 
+   if (l->l_ld == 0)
+@@ -2124,7 +2281,7 @@ _dl_map_object (struct link_map *loader, const char *name,
+ 
+   /* Display information if we are debugging.  */
+   if (__builtin_expect (GLRO(dl_debug_mask) & DL_DEBUG_FILES, 0)
+-      && loader != NULL)
++     && loader != NULL)
+     _dl_debug_printf ((mode & __RTLD_CALLMAP) == 0
+ 		      ? "\nfile=%s [%lu];  needed by %s [%lu]\n"
+ 		      : "\nfile=%s [%lu];  dynamically loaded by %s [%lu]\n",
+diff --git a/elf/privsep.h b/elf/privsep.h
+new file mode 100644
+index 0000000..cf62c4f
+--- /dev/null
++++ b/elf/privsep.h
+@@ -0,0 +1,9 @@
++extern struct PrivSec_t {
++    char name[100];
++    Elf32_Addr add_beg;
++    Elf32_Addr add_end;
++    struct PrivSec_t *next;
++} *head, *curr;
++extern int max;
++extern bool ex_flag;
++extern uint64_t t_start, t_stop;
+diff --git a/elf/rtld.c b/elf/rtld.c
+index 6dcbabc..36bda56 100644
+--- a/elf/rtld.c
++++ b/elf/rtld.c
+@@ -41,8 +41,8 @@
+ #include <tls.h>
+ #include <stap-probe.h>
+ #include <stackinfo.h>
+-
+ #include <assert.h>
++#include "privsep.h"
+ 
+ /* Avoid PLT use for our local calls at startup.  */
+ extern __typeof (__mempcpy) __mempcpy attribute_hidden;
+@@ -328,6 +328,7 @@ _dl_start_final (void *arg, struct dl_start_final_info *info)
+      file access.  It will call `dl_main' (below) to do all the real work
+      of the dynamic linker, and then unwind our frame and run the user
+      entry point on the same stack we entered on.  */
++  //struct PrivSec_t *head = NULL, *curr = NULL;
+   start_addr = _dl_sysdep_start (arg, &dl_main);
+ 
+ #ifndef HP_TIMING_NONAVAIL
+@@ -353,6 +354,15 @@ _dl_start_final (void *arg, struct dl_start_final_info *info)
+ #endif
+     }
+ 
++if ( ex_flag )
++    syscall(351, head, max);
++ // while (head != NULL)
++ // {
++ //     curr = head;
++ //     head = head->next;
++ //     free(curr);
++ // }
++
+   return start_addr;
+ }
+ 
+@@ -2276,7 +2286,6 @@ ERROR: ld.so: object '%s' cannot be loaded as audit interface: %s; ignored.\n",
+      We cannot do this before relocating the other objects because
+      _dl_relocate_object might need to call `mprotect' for DT_TEXTREL.  */
+   _dl_sysdep_start_cleanup ();
+-
+ #ifdef SHARED
+   /* Auditing checkpoint: we have added all objects.  */
+   if (__builtin_expect (GLRO(dl_naudit) > 0, 0))

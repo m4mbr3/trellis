@@ -1,0 +1,645 @@
+diff --git a/Makefile b/Makefile
+index ad368cd..5dfc5d2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 3
+ PATCHLEVEL = 9
+ SUBLEVEL = 0
+-EXTRAVERSION =
++EXTRAVERSION =  PrivilegeSeparation
+ NAME = Unicycling Gorilla
+ 
+ # *DOCUMENTATION*
+diff --git a/arch/x86/syscalls/syscall_32.tbl b/arch/x86/syscalls/syscall_32.tbl
+index e6d55f0..bde7132 100644
+--- a/arch/x86/syscalls/syscall_32.tbl
++++ b/arch/x86/syscalls/syscall_32.tbl
+@@ -357,3 +357,6 @@
+ 348	i386	process_vm_writev	sys_process_vm_writev		compat_sys_process_vm_writev
+ 349	i386	kcmp			sys_kcmp
+ 350	i386	finit_module		sys_finit_module
++351 i386    ps_info			sys_ps_info		
++352 i386    ps_switch       sys_ps_switch
++353 i386    ps_tracemalloc  sys_ps_tracemalloc
+diff --git a/arch/x86/syscalls/syscall_64.tbl b/arch/x86/syscalls/syscall_64.tbl
+index 38ae65d..4fd3f51 100644
+--- a/arch/x86/syscalls/syscall_64.tbl
++++ b/arch/x86/syscalls/syscall_64.tbl
+@@ -320,6 +320,9 @@
+ 311	64	process_vm_writev	sys_process_vm_writev
+ 312	common	kcmp			sys_kcmp
+ 313	common	finit_module		sys_finit_module
++314 64      ps_info			sys_ps_info
++315 64      ps_switch       sys_ps_switch
++316 64      ps_tracemalloc  sys_ps_tracemalloc
+ 
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/include/linux/ps.h b/include/linux/ps.h
+new file mode 100644
+index 0000000..e6e35b9
+--- /dev/null
++++ b/include/linux/ps.h
+@@ -0,0 +1,59 @@
++#include <uapi/linux/elf.h>
++
++#define FREQ_MAX 3600000
++struct PrivSec_t {
++	char name[100];
++	Elf32_Addr add_beg;
++	Elf32_Addr add_end;
++	struct PrivSec_t *next;
++};
++ 
++struct PrivSec_dyn_t {
++    int ps_level;
++    int size;
++    void *mem;
++    struct PrivSec_dyn_t *next;
++};
++                                                                                                                                    
++                                                                                                                                                         
++static inline uint64_t cycle_start(void)                                                                                                                 
++{                                                                                                                                                        
++        uint32_t cycles_low, cycles_high;                                                                                                                
++                                                                                                                                                         
++        asm volatile (                                                                                                                                   
++                "cpuid\n"                                                                                                                                
++                "rdtsc\n"                                                                                                                                
++                "movl %%eax, %0\n"                                                                                                                       
++                "movl %%edx, %1\n"                                                                                                                       
++                : "=r" (cycles_low), "=r" (cycles_high)
++                :
++                : "%rax", "%rbx", "%rcx", "%rdx"
++        );
++
++        return (uint64_t) cycles_high << 32 | (uint64_t) cycles_low;
++}
++
++static inline uint64_t cycle_stop(void)
++{
++        uint32_t cycles_low, cycles_high;
++
++        asm volatile (
++                "rdtscp\n"
++                "movl %%eax, %0\n"
++                "movl %%edx, %1\n"
++                "cpuid\n"
++                : "=r" (cycles_low), "=r" (cycles_high)
++                :
++                : "%rax", "%rbx", "%rcx", "%rdx"
++        );
++
++        return (uint64_t) cycles_high << 32 | (uint64_t) cycles_low;
++}
++
++static inline uint64_t cycle_time(uint64_t cycles)
++{
++        return div64_u64(cycles, FREQ_MAX);
++}
++
++
++
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index be4e742..d8759ed 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1204,7 +1204,12 @@ struct task_struct {
+ 	atomic_t usage;
+ 	unsigned int flags;	/* per process flags, defined below */
+ 	unsigned int ptrace;
+-
++    /* BEGIN - PrivilegeSeparation */
++	struct PrivSec_t *ps_info_h;
++    struct PrivSec_dyn_t *ps_dyn_info_h;
++    int ps_level;
++    unsigned int ps_mprotected;
++    /* END - PrivilegeSeparation */
+ #ifdef CONFIG_SMP
+ 	struct llist_node wake_entry;
+ 	int on_cpu;
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 313a8e0..6763689 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -64,6 +64,7 @@ struct old_linux_dirent;
+ struct perf_event_attr;
+ struct file_handle;
+ struct sigaltstack;
++//struct PrivSec_t;
+ 
+ #include <linux/types.h>
+ #include <linux/aio_abi.h>
+@@ -854,6 +855,7 @@ asmlinkage long sys_syncfs(int fd);
+ 
+ asmlinkage long sys_fork(void);
+ asmlinkage long sys_vfork(void);
++
+ #ifdef CONFIG_CLONE_BACKWARDS
+ asmlinkage long sys_clone(unsigned long, unsigned long, int __user *, int,
+ 	       int __user *);
+@@ -897,4 +899,8 @@ asmlinkage long sys_process_vm_writev(pid_t pid,
+ asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
+ 			 unsigned long idx1, unsigned long idx2);
+ asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
++asmlinkage long sys_ps_info(struct PrivSec_t*, int level);
++asmlinkage long sys_ps_switch(int new_level);
++asmlinkage unsigned long sys_ps_tracemalloc (unsigned long addr, unsigned long len,
++            int prot, int flags, char *cmd, int privlev);
+ #endif
+diff --git a/include/uapi/linux/netlink.h b/include/uapi/linux/netlink.h
+index 78d5b8a..a289435 100644
+--- a/include/uapi/linux/netlink.h
++++ b/include/uapi/linux/netlink.h
+@@ -26,7 +26,7 @@
+ #define NETLINK_ECRYPTFS	19
+ #define NETLINK_RDMA		20
+ #define NETLINK_CRYPTO		21	/* Crypto layer */
+-
++#define NETLINK_PS          22
+ #define NETLINK_INET_DIAG	NETLINK_SOCK_DIAG
+ 
+ #define MAX_LINKS 32		
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 5a51e6c..03cf53e 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -47,6 +47,9 @@ obj-$(CONFIG_SMP) += smp.o
+ ifneq ($(CONFIG_SMP),y)
+ obj-y += up.o
+ endif
++obj-y += ps_info.o
++obj-y += ps_switch.o
++obj-y += ps_tracemalloc.o
+ obj-$(CONFIG_SMP) += spinlock.o
+ obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock.o
+ obj-$(CONFIG_PROVE_LOCKING) += spinlock.o
+diff --git a/kernel/cycles.h b/kernel/cycles.h
+new file mode 100644
+index 0000000..f9c9522
+--- /dev/null
++++ b/kernel/cycles.h
+@@ -0,0 +1,46 @@
++#ifndef _CYCLES_H                                                                                                                                        
++#define _CYCLES_H                                                                                                                                        
++                                                                                                                                                         
++#include <stdint.h>                                                                                                                                      
++                                                                                                                                                         
++static inline uint64_t cycle_start(void)                                                                                                                 
++{                                                                                                                                                        
++        uint32_t cycles_low, cycles_high;                                                                                                                
++                                                                                                                                                         
++        asm volatile (                                                                                                                                   
++                "cpuid\n"                                                                                                                                
++                "rdtsc\n"                                                                                                                                
++                "movl %%eax, %0\n"                                                                                                                       
++                "movl %%edx, %1\n"                                                                                                                       
++                : "=r" (cycles_low), "=r" (cycles_high)
++                :
++                : "%rax", "%rbx", "%rcx", "%rdx"
++        );
++
++        return (uint64_t) cycles_high << 32 | (uint64_t) cycles_low;
++}
++
++static inline uint64_t cycle_stop(void)
++{
++        uint32_t cycles_low, cycles_high;
++
++        asm volatile (
++                "rdtscp\n"
++                "movl %%eax, %0\n"
++                "movl %%edx, %1\n"
++                "cpuid\n"
++                : "=r" (cycles_low), "=r" (cycles_high)
++                :
++                : "%rax", "%rbx", "%rcx", "%rdx"
++        );
++
++        return (uint64_t) cycles_high << 32 | (uint64_t) cycles_low;
++}
++
++static inline double cycle_time(uint64_t cycles)
++{
++        return (double) cycles / (double) FREQ_MAX;
++}
++
++#endif
++
+diff --git a/kernel/ps_info.c b/kernel/ps_info.c
+new file mode 100644
+index 0000000..5bfe094
+--- /dev/null
++++ b/kernel/ps_info.c
+@@ -0,0 +1,51 @@
++/* 
++ * ps_info - Syscall that  copies the information about an application to provide
++ * privilege separation among users 
++ *
++ */
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/ps.h>
++
++asmlinkage long sys_ps_info(struct PrivSec_t *h, int level) 
++{
++	if (current->ps_info_h == NULL) {
++		struct PrivSec_t *cur = h;
++		struct PrivSec_t *head=NULL, *tail=NULL;
++		//struct PrivSec_t *to_del = NULL;
++		printk("WELCOME PS_INFO SYSCALL\n");
++		while (cur != NULL) {
++		  if (head == NULL) {
++			head = kmalloc(sizeof(struct PrivSec_t), GFP_KERNEL);
++			if (copy_from_user(head, cur, sizeof(struct PrivSec_t))) 
++				return -EFAULT;
++			head->next = NULL;
++			tail = head;
++		  }
++		  else {	     
++		     tail->next = kmalloc(sizeof(struct PrivSec_t), GFP_KERNEL);
++		     tail = tail->next;
++		     if (copy_from_user(tail, cur, sizeof(struct PrivSec_t))) 
++				return -EFAULT;
++		     tail->next = NULL;
++		  }
++		  cur = cur->next;
++		}
++		tail = head;
++		while(tail != NULL) {
++		   printk("Name: %s \n", tail->name);
++		   printk("mapstart: %x \n", tail->add_beg);
++		   printk("mapend: %x \n", tail->add_end);
++		   printk("----------------------------\n");
++		   tail = tail->next;
++		}
++		current->ps_info_h = head;
++        current->ps_mprotected = 1;
++		printk("Pid: %u\n", current->pid);
++	}	
++	else { 
++		printk("INVALID DOUBLE CALL TO PS_INFO SYSCALL\n");
++	}
++    current->ps_level = level;
++	return 0;
++}
+diff --git a/kernel/ps_switch.c b/kernel/ps_switch.c
+new file mode 100644
+index 0000000..4356e5a
+--- /dev/null
++++ b/kernel/ps_switch.c
+@@ -0,0 +1,175 @@
++/*
++ * ps_switch - Syscall that moves from a level to another the application program
++ *
++ *
++ */
++ 
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/ps.h>
++#include <linux/mman.h>
++#include <linux/netlink.h>
++#include <asm/timer.h>
++#include <net/sock.h>
++
++#define EXPORT_SYMTAB
++
++struct sock *sk_b = NULL;
++EXPORT_SYMBOL_GPL(sk_b);
++wait_queue_head_t ps_wait_for_msg;
++DECLARE_WAIT_QUEUE_HEAD(ps_wait_for_msg);
++EXPORT_SYMBOL_GPL(ps_wait_for_msg);
++int ps_daemon_pid;
++EXPORT_SYMBOL_GPL(ps_daemon_pid);
++char ps_buffer[20];
++EXPORT_SYMBOL_GPL(ps_buffer);
++/* Function to compare the first part of the string and see if it matches*/
++int
++_cmp_ps_string (char *str1, const char *str2) 
++{
++    int len1, len2, i;
++	if (*str1 == '\0') return -1;
++         len2 = strlen(str2);
++	len1 = strlen(str1);
++	if (len2 > len1) return -1;
++	for (i=0; i<len2; ++i) {
++	  if (*(str1+i) != *(str2+i)) return -1; 
++	}
++	return 1;
++}
++
++int
++login(int new_level)
++{
++    struct nlmsghdr *nlh;
++    char str[15];
++    int msgsize = sizeof(str);
++    int res;
++    struct sk_buff  *skb_out;
++    if ( sk_b == NULL ) {
++        printk("PS_SWITCH: Load the module to register the netlink \n");
++        return -1;
++    }
++    memset(str, 0, sizeof(str));
++    sprintf(str, "%d", new_level);
++    skb_out = nlmsg_new(msgsize, 0);
++    if (!skb_out){
++        printk(KERN_ERR "PS_SWITCH: Failed to allocate new skb\n");
++        return  -1;
++    }
++    nlh = nlmsg_put(skb_out, 0, 0, NLMSG_DONE, msgsize, 0);
++    NETLINK_CB(skb_out).dst_group = 0;
++    strncpy((char *)nlmsg_data(nlh), str, msgsize);
++    res = nlmsg_unicast(sk_b, skb_out, ps_daemon_pid);
++    if (res < 0) {
++        printk(KERN_INFO "PS_SWITCH: Error while unlock the daemon\n");
++        return -1;
++    }   
++    //printk("PS_SWITCH: Going to sleep waiting messages\n");
++    interruptible_sleep_on(&ps_wait_for_msg);
++    printk("PS_SWITCH: The answer is %s\n", ps_buffer); 
++    if (strncmp(ps_buffer, "OK", 2) == 0) return 0;
++    else if (strncmp(ps_buffer, "NO", 2) == 0) return -1;
++    else return -1;
++}
++
++asmlinkage long sys_ps_switch (int new_level) {
++    uint64_t start, stop;
++    struct PrivSec_t *head = current->ps_info_h;
++    struct PrivSec_dyn_t *curr;
++    int res;
++    start = cycle_start();
++    if (current->ps_info_h == NULL) {
++        printk ("PS_SWITCH: The program %u is not designed to use the "
++                 "Privilege Separation system\n", current->pid);
++        return 0;
++    }
++
++    if (current->ps_level <= new_level) {
++        //In this case the application is losing the privile.
++        //printk("PS_SWITCH: DOWNGRADE from level %u to level %u \n", current->ps_level , new_level);
++        while (head != NULL) {
++            unsigned long lev;
++            int ret;
++            ret = kstrtoul(head->name+8, 10, &lev);
++            if (ret != 0) return 0;
++            if (lev < new_level) {
++               current->ps_mprotected = 0;
++               sys_mprotect ((long) head->add_beg, 
++                (size_t) head->add_end-head->add_beg, 
++                PROT_NONE);
++               
++               current->ps_mprotected = 1;
++            }
++            head = head->next;
++        } 
++        curr = current->ps_dyn_info_h;
++        while(curr != NULL) {
++            if ( curr->ps_level < new_level) {
++                current->ps_mprotected = 0;
++                sys_mprotect ((long) curr->mem,
++                    (size_t) curr->size, 
++                        PROT_NONE);
++                current->ps_mprotected = 1;
++            }
++            curr = curr->next;
++        }
++        current->ps_level = new_level;
++        stop = cycle_stop();
++        //printk ("start : %llu\n", start);
++        //printk ("stop : %llu\n", stop);
++        printk("downgrade cycles : %llu\n", stop - start);
++        return 1;
++    }
++    else {
++        //In this case the application is earning the privile.
++        //printk("PS_SWITCH: UPGRADE from level %u to level %u \n", current->ps_level, new_level);
++        res = login(new_level); 
++        if (res == 0){ 
++            while (head != NULL) {
++                unsigned long lev;
++                int ret;
++                ret = kstrtoul(head->name+8, 10, &lev);
++                if (ret != 0 ) return 0;
++                if (lev >= new_level) {
++                   current->ps_mprotected = 0;
++                   if (_cmp_ps_string(head->name, ".fun_ps_") == 1)
++                    sys_mprotect ((long) head->add_beg,
++                      (size_t) head->add_end-head->add_beg,
++                      PROT_READ | PROT_EXEC);
++                   if (_cmp_ps_string(head->name, ".dat_ps_") == 1)
++                    sys_mprotect ((long) head->add_beg,
++                      (size_t) head->add_end-head->add_beg,
++                      PROT_READ | PROT_WRITE);
++                   current->ps_mprotected = 1;
++                }
++                head = head->next;
++            }
++            curr = current->ps_dyn_info_h;
++            while(curr!=NULL) {
++                if( curr->ps_level >= new_level) {
++                    current->ps_mprotected = 0;
++                    sys_mprotect ((long) curr->mem, 
++                      (size_t) curr->size,
++                      PROT_READ | PROT_WRITE);
++                    current->ps_mprotected = 1;
++                }
++                curr = curr->next;
++            }
++            current->ps_level = new_level;
++        }
++        else{ 
++            printk ("PS_SWITCH: UPGRADE to %u has failed because noone authentication token provide was correct \n", new_level); 
++            stop = cycle_stop();
++            printk ("start : %llu\n", start);
++            printk ("stop : %llu\n", stop);
++            printk("cycles : %llu\n", stop - start);
++            return 0;
++        }
++        stop = cycle_stop();
++        //printk ("start : %llu\n", start);
++        //printk ("stop : %llu\n", stop);
++        printk("upgrade cycles :  %llu\n", stop - start);
++        return 1;
++    }
++}
+diff --git a/kernel/ps_tracemalloc.c b/kernel/ps_tracemalloc.c
+new file mode 100644
+index 0000000..5ba9383
+--- /dev/null
++++ b/kernel/ps_tracemalloc.c
+@@ -0,0 +1,138 @@
++/*
++ * ps_tracemalloc - Syscall that trace for each malloc and free
++ * the dynamic data allocation and protect them from improper access
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/ps.h>
++#include <linux/mman.h>
++#include <linux/string.h>
++
++
++asmlinkage unsigned long sys_ps_tracemalloc (unsigned long addr,
++                                    unsigned long len,
++                                    int prot,
++                                    int flags,
++                                    char *cmd,
++                                    int privlev) {
++
++    int found = 0;
++    struct PrivSec_dyn_t *curr = NULL;
++    struct PrivSec_dyn_t *new = NULL;
++    struct PrivSec_dyn_t *next = NULL;
++    unsigned long ptr;
++
++
++
++    if (strncmp(cmd,"MMAP", 4) == 0) {
++
++       ptr = sys_mmap_pgoff(addr, len, prot, flags, -1, (off_t)0);
++
++       //printk (KERN_INFO "PS_TRACEMALLOC: The command provided is MMAP \n");
++       //printk (KERN_INFO "PS_TRACEMALLOC: %lx ptr, %lu size\n", ptr, len);
++
++       if (!IS_ERR((void *) ptr))
++           force_successful_syscall_return();
++
++       if (current->ps_info_h == NULL) {
++           return ptr;
++       }
++
++       if (current->ps_dyn_info_h == NULL) {
++            //create a new element that will be the first of the list
++            struct PrivSec_dyn_t *new =
++                (struct PrivSec_dyn_t *) kmalloc(sizeof(struct PrivSec_dyn_t),
++                                          GFP_ATOMIC);
++            new->ps_level = privlev;
++            new->size = len;
++            new->mem = (void *) ptr;
++            new->next = NULL;
++            current->ps_dyn_info_h = new;
++            return ptr;
++       }
++       curr = current->ps_dyn_info_h;
++       while (curr->next != NULL) curr = curr->next;
++       new = (struct PrivSec_dyn_t *) kmalloc(sizeof(struct PrivSec_dyn_t),
++                                      GFP_ATOMIC);
++       new->ps_level = privlev;
++       new->size = len;
++       new->mem = (void *) ptr;
++       new->next = NULL;
++       curr->next = new;
++       return ptr;
++    }
++    else if (strncmp(cmd, "MUNMAP", 6) == 0) {
++
++        //printk (KERN_INFO "PS_TRACEMALLOC: The command provided is MUNMAP \n");
++        //printk (KERN_INFO "PS_TRACEMALLOC: %lx address, %lu size\n", addr, len);
++        if (current->ps_info_h == NULL) {
++            sys_munmap(addr, len);
++            return 1;
++        }
++
++        if (current->ps_dyn_info_h == NULL) return -1; //case zero elements.
++
++        curr = current->ps_dyn_info_h;
++
++        if (curr->next == NULL) {
++            //case only one element inside the list
++            if (curr->mem == (void *)addr) {
++                kfree(curr);
++                current->ps_dyn_info_h = NULL;
++                sys_munmap (addr, len);
++                return 1;
++            }
++            else {
++                return -EINVAL;
++            }
++        }
++        next = curr->next;
++        if (next->next == NULL) {
++           //case two elements inside the list.
++           if (curr->mem == (void *) addr) {
++                current->ps_dyn_info_h = next;
++                kfree(curr);
++                sys_munmap (addr, len);
++                return 1;
++           }
++           else if (next->mem == (void *) addr) {
++                curr->next = NULL;
++                kfree(next);
++                sys_munmap (addr, len);
++                return 1;
++           }
++           else {
++               return -EINVAL;
++           }
++        }
++        found = 0;
++        while(!found && next != NULL) {
++            if (curr->mem == (void *) addr) found=2;
++            else if (next->mem == (void *) addr ) found=1;
++            else {
++                next = next->next;
++                curr = curr->next;
++            }
++        }
++        if (found == 2) {
++            current->ps_dyn_info_h = next;
++            kfree(curr);
++            sys_munmap (addr, len);
++            return 1;
++        }
++        if (found == 1) {
++            curr->next = next->next;
++            kfree(next);
++            sys_munmap (addr, len);
++            return 1;
++        }
++        return -EINVAL;
++    }
++    else {
++        printk (KERN_ERR "PS_TRACEMALLOC: Unknown command provided\n");
++        return -EINVAL;
++    }
++    return -EINVAL;
++}
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 94722a4..520d4ce 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -27,6 +27,7 @@
+ #include <asm/pgtable.h>
+ #include <asm/cacheflush.h>
+ #include <asm/tlbflush.h>
++#include <linux/ps.h>
+ 
+ #ifndef pgprot_modify
+ static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
+@@ -321,11 +322,20 @@ fail:
+ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
+ 		unsigned long, prot)
+ {
+-	unsigned long vm_flags, nstart, end, tmp, reqprot;
++    unsigned long vm_flags, nstart, end, tmp, reqprot;
+ 	struct vm_area_struct *vma, *prev;
+ 	int error = -EINVAL;
+ 	const int grows = prot & (PROT_GROWSDOWN|PROT_GROWSUP);
+ 	prot &= ~(PROT_GROWSDOWN|PROT_GROWSUP);
++    if (current->ps_info_h != NULL  && current->ps_mprotected == 1) {
++        struct PrivSec_t *cur = current->ps_info_h; 
++        while(cur != NULL)  {
++            if (!((start < cur->add_beg && (start+len) < cur->add_beg) || 
++                   (start > cur->add_end)))
++                return -EINVAL;
++            cur = cur->next;
++        }
++    }
+ 	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP)) /* can't be both */
+ 		return -EINVAL;
+ 

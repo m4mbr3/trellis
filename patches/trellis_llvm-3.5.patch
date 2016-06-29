@@ -1,0 +1,1511 @@
+diff --git a/include/llvm-c/Core.h b/include/llvm-c/Core.h
+index fdff77b..ed73ede 100644
+--- a/include/llvm-c/Core.h
++++ b/include/llvm-c/Core.h
+@@ -156,8 +156,8 @@ typedef enum {
+     LLVMStackAlignment = 7<<26,
+     LLVMReturnsTwice = 1 << 29,
+     LLVMUWTable = 1 << 30,
+-    LLVMNonLazyBind = 1 << 31
+-
++    LLVMNonLazyBind = 1 << 31,
++    LLVMPrivilegeSeparation = 1ULL << 37
+     /* FIXME: These attributes are currently not included in the C API as
+        a temporary measure until the API/ABI impact to the C API is understood
+        and the path forward agreed upon.
+diff --git a/include/llvm/Bitcode/LLVMBitCodes.h b/include/llvm/Bitcode/LLVMBitCodes.h
+index ee2efa2..0164f71 100644
+--- a/include/llvm/Bitcode/LLVMBitCodes.h
++++ b/include/llvm/Bitcode/LLVMBitCodes.h
+@@ -375,7 +375,8 @@ namespace bitc {
+     ATTR_KIND_IN_ALLOCA = 38,
+     ATTR_KIND_NON_NULL = 39,
+     ATTR_KIND_JUMP_TABLE = 40,
+-    ATTR_KIND_DEREFERENCEABLE = 41
++    ATTR_KIND_DEREFERENCEABLE = 41,
++    ATTR_KIND_PRIVILEGE_SEPARATION = 42
+   };
+ 
+   enum ComdatSelectionKindCodes {
+diff --git a/include/llvm/IR/Attributes.h b/include/llvm/IR/Attributes.h
+index 5ff48d6..bd214f1 100644
+--- a/include/llvm/IR/Attributes.h
++++ b/include/llvm/IR/Attributes.h
+@@ -114,7 +114,7 @@ public:
+     ZExt,                  ///< Zero extended before/after call
+ 
+     EndAttrKinds           ///< Sentinal value useful for loops
+-  };
++   };
+ private:
+   AttributeImpl *pImpl;
+   Attribute(AttributeImpl *A) : pImpl(A) {}
+@@ -273,13 +273,13 @@ public:
+   /// \brief Remove the specified attribute at the specified index from this
+   /// attribute list. Since attribute lists are immutable, this returns the new
+   /// list.
+-  AttributeSet removeAttribute(LLVMContext &C, unsigned Index, 
++  AttributeSet removeAttribute(LLVMContext &C, unsigned Index,
+                                Attribute::AttrKind Attr) const;
+ 
+   /// \brief Remove the specified attributes at the specified index from this
+   /// attribute list. Since attribute lists are immutable, this returns the new
+   /// list.
+-  AttributeSet removeAttributes(LLVMContext &C, unsigned Index, 
++  AttributeSet removeAttributes(LLVMContext &C, unsigned Index,
+                                 AttributeSet Attrs) const;
+ 
+   //===--------------------------------------------------------------------===//
+diff --git a/include/llvm/IR/GlobalValue.h b/include/llvm/IR/GlobalValue.h
+index 68e410b..9bc141f 100644
+--- a/include/llvm/IR/GlobalValue.h
++++ b/include/llvm/IR/GlobalValue.h
+@@ -20,6 +20,7 @@
+ 
+ #include "llvm/IR/Constant.h"
+ #include "llvm/IR/DerivedTypes.h"
++#include "llvm/Transforms/PrivilegeSeparation.h"
+ 
+ namespace llvm {
+ 
+@@ -67,6 +68,7 @@ protected:
+         DllStorageClass(DefaultStorageClass),
+         ThreadLocal(NotThreadLocal), Parent(nullptr) {
+     setName(Name);
++    privilegeSeparation = NUM_OF_LEVELS - 1;
+   }
+ 
+   // Note: VC++ treats enums as signed, so an extra bit is required to prevent
+@@ -93,6 +95,7 @@ protected:
+   }
+ 
+   Module *Parent;             // The containing module.
++  unsigned int privilegeSeparation;
+ public:
+   enum ThreadLocalMode {
+     NotThreadLocal = 0,
+@@ -106,6 +109,19 @@ public:
+     removeDeadConstantUsers();   // remove any dead constants using this.
+   }
+ 
++  ///Getter and Setter for the privilegeSeparation level
++  void setPrivilegeSeparation(unsigned int pS) {
++       privilegeSeparation = pS;
++  }
++
++  unsigned int getPrivilegeSeparation(void) {
++      return privilegeSeparation;
++  }
++
++  unsigned int getPrivilegeSeparation(void) const {
++      return privilegeSeparation;
++  }
++
+   unsigned getAlignment() const;
+ 
+   bool hasUnnamedAddr() const { return UnnamedAddr; }
+diff --git a/include/llvm/IR/GlobalVariable.h b/include/llvm/IR/GlobalVariable.h
+index 4189ccb..0c650a4 100644
+--- a/include/llvm/IR/GlobalVariable.h
++++ b/include/llvm/IR/GlobalVariable.h
+@@ -24,7 +24,7 @@
+ #include "llvm/ADT/ilist_node.h"
+ #include "llvm/IR/GlobalObject.h"
+ #include "llvm/IR/OperandTraits.h"
+-
++#include "llvm/Transforms/PrivilegeSeparation.h"
+ namespace llvm {
+ 
+ class Module;
+@@ -45,7 +45,6 @@ class GlobalVariable : public GlobalObject, public ilist_node<GlobalVariable> {
+                                                // can change from its initial
+                                                // value before global
+                                                // initializers are run?
+-
+ public:
+   // allocate space for exactly one operand
+   void *operator new(size_t s) {
+diff --git a/include/llvm/Transforms/PrivilegeSeparation.h b/include/llvm/Transforms/PrivilegeSeparation.h
+new file mode 100644
+index 0000000..9713fe4
+--- /dev/null
++++ b/include/llvm/Transforms/PrivilegeSeparation.h
+@@ -0,0 +1,2 @@
++#define NUM_OF_LEVELS 10
++
+diff --git a/lib/AsmParser/LLLexer.cpp b/lib/AsmParser/LLLexer.cpp
+index 962298f..8e89c46 100644
+--- a/lib/AsmParser/LLLexer.cpp
++++ b/lib/AsmParser/LLLexer.cpp
+@@ -569,6 +569,7 @@ lltok::Kind LLLexer::LexIdentifier() {
+   KEYWORD(exact);
+   KEYWORD(inbounds);
+   KEYWORD(align);
++  KEYWORD(privilegeSeparation);
+   KEYWORD(addrspace);
+   KEYWORD(section);
+   KEYWORD(alias);
+diff --git a/lib/AsmParser/LLParser.cpp b/lib/AsmParser/LLParser.cpp
+index ac6e0e5..cb3dc34 100644
+--- a/lib/AsmParser/LLParser.cpp
++++ b/lib/AsmParser/LLParser.cpp
+@@ -25,6 +25,7 @@
+ #include "llvm/IR/ValueSymbolTable.h"
+ #include "llvm/Support/ErrorHandling.h"
+ #include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/PrivilegeSeparation.h"
+ using namespace llvm;
+ 
+ static std::string getTypeString(Type *T) {
+@@ -893,6 +894,10 @@ bool LLParser::ParseGlobal(const std::string &Name, LocTy NameLoc,
+       unsigned Alignment;
+       if (ParseOptionalAlignment(Alignment)) return true;
+       GV->setAlignment(Alignment);
++    } else if (Lex.getKind() == lltok::kw_privilegeSeparation) {
++      unsigned int privilegeSeparation;
++      ParsePrivilegeSeparation(privilegeSeparation);
++      GV->setPrivilegeSeparation(privilegeSeparation);
+     } else {
+       Comdat *C;
+       if (parseOptionalComdat(C))
+@@ -1650,6 +1655,15 @@ bool LLParser::ParseOptionalDereferenceableBytes(uint64_t &Bytes) {
+     return Error(DerefLoc, "dereferenceable bytes must be non-zero");
+   return false;
+ }
++/// ParsePrivilegeSeparation
++/// ::= privilegeSeparation 9
++bool LLParser::ParsePrivilegeSeparation(unsigned int &privilegeSeparation) {
++    if (ParseUInt32(privilegeSeparation)) return true;
++    LocTy privilegeSepLoc = Lex.getLoc();
++    if (privilegeSeparation >= NUM_OF_LEVELS)
++        return Error(privilegeSepLoc, "Privilege level out of bound");
++    return false;
++}
+ 
+ /// ParseOptionalCommaAlign
+ ///   ::=
+diff --git a/lib/AsmParser/LLParser.h b/lib/AsmParser/LLParser.h
+index 7203bb2..dac6247 100644
+--- a/lib/AsmParser/LLParser.h
++++ b/lib/AsmParser/LLParser.h
+@@ -224,6 +224,7 @@ namespace llvm {
+     bool ParseOptionalDLLStorageClass(unsigned &DLLStorageClass);
+     bool ParseOptionalCallingConv(CallingConv::ID &CC);
+     bool ParseOptionalAlignment(unsigned &Alignment);
++    bool ParsePrivilegeSeparation(unsigned int &privilegeSeparation);
+     bool ParseOptionalDereferenceableBytes(uint64_t &Bytes);
+     bool ParseScopeAndOrdering(bool isAtomic, SynchronizationScope &Scope,
+                                AtomicOrdering &Ordering);
+diff --git a/lib/AsmParser/LLToken.h b/lib/AsmParser/LLToken.h
+index 2f02606..6882483 100644
+--- a/lib/AsmParser/LLToken.h
++++ b/lib/AsmParser/LLToken.h
+@@ -75,6 +75,7 @@ namespace lltok {
+     kw_exact,
+     kw_inbounds,
+     kw_align,
++    kw_privilegeSeparation,
+     kw_addrspace,
+     kw_section,
+     kw_alias,
+diff --git a/lib/Bitcode/Reader/BitcodeReader.cpp b/lib/Bitcode/Reader/BitcodeReader.cpp
+index 47a3953..82e5e86 100644
+--- a/lib/Bitcode/Reader/BitcodeReader.cpp
++++ b/lib/Bitcode/Reader/BitcodeReader.cpp
+@@ -1874,7 +1874,7 @@ std::error_code BitcodeReader::ParseModule(bool Resume) {
+       break;
+     }
+     // GLOBALVAR: [pointer type, isconst, initid,
+-    //             linkage, alignment, section, visibility, threadlocal,
++    //             linkage, alignment, section, privilegeSeparation, visibility, threadlocal,
+     //             unnamed_addr, dllstorageclass]
+     case bitc::MODULE_CODE_GLOBALVAR: {
+       if (Record.size() < 6)
+@@ -1896,23 +1896,24 @@ std::error_code BitcodeReader::ParseModule(bool Resume) {
+           return Error(InvalidID);
+         Section = SectionTable[Record[5]-1];
+       }
++      unsigned int privilegeSeparation = Record[6];
+       GlobalValue::VisibilityTypes Visibility = GlobalValue::DefaultVisibility;
+       // Local linkage must have default visibility.
+-      if (Record.size() > 6 && !GlobalValue::isLocalLinkage(Linkage))
++      if (Record.size() > 7 && !GlobalValue::isLocalLinkage(Linkage))
+         // FIXME: Change to an error if non-default in 4.0.
+         Visibility = GetDecodedVisibility(Record[6]);
+ 
+       GlobalVariable::ThreadLocalMode TLM = GlobalVariable::NotThreadLocal;
+-      if (Record.size() > 7)
++      if (Record.size() > 8)
+         TLM = GetDecodedThreadLocalMode(Record[7]);
+ 
+       bool UnnamedAddr = false;
+-      if (Record.size() > 8)
+-        UnnamedAddr = Record[8];
++      if (Record.size() > 9)
++        UnnamedAddr = Record[9];
+ 
+       bool ExternallyInitialized = false;
+-      if (Record.size() > 9)
+-        ExternallyInitialized = Record[9];
++      if (Record.size() > 10)
++        ExternallyInitialized = Record[10];
+ 
+       GlobalVariable *NewGV =
+         new GlobalVariable(*TheModule, Ty, isConstant, Linkage, nullptr, "", nullptr,
+@@ -1922,9 +1923,9 @@ std::error_code BitcodeReader::ParseModule(bool Resume) {
+         NewGV->setSection(Section);
+       NewGV->setVisibility(Visibility);
+       NewGV->setUnnamedAddr(UnnamedAddr);
+-
+-      if (Record.size() > 10)
+-        NewGV->setDLLStorageClass(GetDecodedDLLStorageClass(Record[10]));
++      NewGV->setPrivilegeSeparation(privilegeSeparation);
++      if (Record.size() > 11)
++        NewGV->setDLLStorageClass(GetDecodedDLLStorageClass(Record[11]));
+       else
+         UpgradeDLLImportExportLinkage(NewGV, Record[3]);
+ 
+diff --git a/lib/Bitcode/Writer/BitcodeWriter.cpp b/lib/Bitcode/Writer/BitcodeWriter.cpp
+index b2e4948..c2a0072 100644
+--- a/lib/Bitcode/Writer/BitcodeWriter.cpp
++++ b/lib/Bitcode/Writer/BitcodeWriter.cpp
+@@ -28,6 +28,7 @@
+ #include "llvm/Support/MathExtras.h"
+ #include "llvm/Support/Program.h"
+ #include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/PrivilegeSeparation.h"
+ #include <cctype>
+ #include <map>
+ using namespace llvm;
+@@ -634,6 +635,7 @@ static void WriteModuleInfo(const Module *M, const ValueEnumerator &VE,
+     else
+       Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed,
+                                Log2_32_Ceil(SectionMap.size()+1)));
++    Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed,NUM_OF_LEVELS));      // PrivilegeSeparation
+     // Don't bother emitting vis + thread local.
+     SimpleGVarAbbrev = Stream.EmitAbbrev(Abbv);
+   }
+@@ -644,7 +646,7 @@ static void WriteModuleInfo(const Module *M, const ValueEnumerator &VE,
+     unsigned AbbrevToUse = 0;
+ 
+     // GLOBALVAR: [type, isconst, initid,
+-    //             linkage, alignment, section, visibility, threadlocal,
++    //             linkage, alignment, section, privilegeSeparation, visibility, threadlocal,
+     //             unnamed_addr, externally_initialized, dllstorageclass]
+     Vals.push_back(VE.getTypeID(GV.getType()));
+     Vals.push_back(GV.isConstant());
+@@ -653,6 +655,7 @@ static void WriteModuleInfo(const Module *M, const ValueEnumerator &VE,
+     Vals.push_back(getEncodedLinkage(GV));
+     Vals.push_back(Log2_32(GV.getAlignment())+1);
+     Vals.push_back(GV.hasSection() ? SectionMap[GV.getSection()] : 0);
++    Vals.push_back(GV.getPrivilegeSeparation());
+     if (GV.isThreadLocal() ||
+         GV.getVisibility() != GlobalValue::DefaultVisibility ||
+         GV.hasUnnamedAddr() || GV.isExternallyInitialized() ||
+diff --git a/lib/IR/AsmWriter.cpp b/lib/IR/AsmWriter.cpp
+index a7499bc..086a407 100644
+--- a/lib/IR/AsmWriter.cpp
++++ b/lib/IR/AsmWriter.cpp
+@@ -1494,7 +1494,7 @@ void AssemblyWriter::printGlobal(const GlobalVariable *GV) {
+   }
+   if (GV->getAlignment())
+     Out << ", align " << GV->getAlignment();
+-
++  Out << ", privilegeSeparation  " << GV->getPrivilegeSeparation();
+   printInfoComment(*GV);
+ }
+ 
+diff --git a/lib/IR/Attributes.cpp b/lib/IR/Attributes.cpp
+index 04545ea..1efbf96 100644
+--- a/lib/IR/Attributes.cpp
++++ b/lib/IR/Attributes.cpp
+@@ -1222,14 +1222,14 @@ AttrBuilder &AttrBuilder::addRawValue(uint64_t Val) {
+       continue;
+     if (uint64_t A = (Val & AttributeImpl::getAttrMask(I))) {
+       Attrs[I] = true;
+- 
++
+       if (I == Attribute::Alignment)
+         Alignment = 1ULL << ((A >> 16) - 1);
+       else if (I == Attribute::StackAlignment)
+         StackAlignment = 1ULL << ((A >> 26)-1);
+     }
+   }
+- 
++
+   return *this;
+ }
+ 
+diff --git a/lib/IR/Globals.cpp b/lib/IR/Globals.cpp
+index 244e3e4..5b123cd 100644
+--- a/lib/IR/Globals.cpp
++++ b/lib/IR/Globals.cpp
+@@ -19,6 +19,7 @@
+ #include "llvm/IR/GlobalAlias.h"
+ #include "llvm/IR/GlobalVariable.h"
+ #include "llvm/IR/LeakDetector.h"
++#include "llvm/Transforms/PrivilegeSeparation.h"
+ #include "llvm/IR/Module.h"
+ #include "llvm/IR/Operator.h"
+ #include "llvm/Support/ErrorHandling.h"
+@@ -57,6 +58,7 @@ void GlobalValue::copyAttributesFrom(const GlobalValue *Src) {
+   setVisibility(Src->getVisibility());
+   setUnnamedAddr(Src->hasUnnamedAddr());
+   setDLLStorageClass(Src->getDLLStorageClass());
++  setPrivilegeSeparation(Src->getPrivilegeSeparation());
+ }
+ 
+ unsigned GlobalValue::getAlignment() const {
+@@ -143,7 +145,6 @@ GlobalVariable::GlobalVariable(Type *Ty, bool constant, LinkageTypes Link,
+            "Initializer should be the same type as the GlobalVariable!");
+     Op<0>() = InitVal;
+   }
+-
+   LeakDetector::addGarbageObject(this);
+ }
+ 
+diff --git a/lib/IR/Verifier.cpp b/lib/IR/Verifier.cpp
+index 9cf911b..15c6579 100644
+--- a/lib/IR/Verifier.cpp
++++ b/lib/IR/Verifier.cpp
+@@ -616,9 +616,9 @@ void Verifier::visitComdat(const Comdat &C) {
+ 
+ void Verifier::visitModuleIdents(const Module &M) {
+   const NamedMDNode *Idents = M.getNamedMetadata("llvm.ident");
+-  if (!Idents) 
++  if (!Idents)
+     return;
+-  
++
+   // llvm.ident takes a list of metadata entry. Each entry has only one string.
+   // Scan each llvm.ident entry and make sure that this requirement is met.
+   for (unsigned i = 0, e = Idents->getNumOperands(); i != e; ++i) {
+@@ -629,7 +629,7 @@ void Verifier::visitModuleIdents(const Module &M) {
+             ("invalid value for llvm.ident metadata entry operand"
+              "(the operand should be a string)"),
+             N->getOperand(0));
+-  } 
++  }
+ }
+ 
+ void Verifier::visitModuleFlags(const Module &M) {
+@@ -935,7 +935,7 @@ void Verifier::VerifyFunctionAttrs(FunctionType *FT, AttributeSet Attrs,
+                                Attribute::AlwaysInline)),
+           "Attributes 'noinline and alwaysinline' are incompatible!", V);
+ 
+-  if (Attrs.hasAttribute(AttributeSet::FunctionIndex, 
++  if (Attrs.hasAttribute(AttributeSet::FunctionIndex,
+                          Attribute::OptimizeNone)) {
+     Assert1(Attrs.hasAttribute(AttributeSet::FunctionIndex,
+                                Attribute::NoInline),
+diff --git a/lib/Target/CppBackend/CPPBackend.cpp b/lib/Target/CppBackend/CPPBackend.cpp
+index f610fbb..0cd3a90 100644
+--- a/lib/Target/CppBackend/CPPBackend.cpp
++++ b/lib/Target/CppBackend/CPPBackend.cpp
+@@ -123,11 +123,11 @@ namespace {
+ 
+     void error(const std::string& msg);
+ 
+-    
++
+     formatted_raw_ostream& nl(formatted_raw_ostream &Out, int delta = 0);
+     inline void in() { indent_level++; }
+     inline void out() { if (indent_level >0) indent_level--; }
+-    
++
+   private:
+     void printLinkageType(GlobalValue::LinkageTypes LT);
+     void printVisibilityType(GlobalValue::VisibilityTypes VisTypes);
+@@ -411,10 +411,10 @@ std::string CppWriter::getCppName(Type* Ty) {
+   if (StructType *STy = dyn_cast<StructType>(Ty))
+     if (STy->hasName())
+       name = STy->getName();
+-  
++
+   if (name.empty())
+     name = utostr(uniqueNum++);
+-  
++
+   name = std::string(prefix) + name;
+   sanitize(name);
+ 
+@@ -814,7 +814,7 @@ void CppWriter::printConstant(const Constant *CV) {
+         nl(Out);
+       }
+       Out << "Constant* " << constName;
+-      
++
+       if (isa<ArrayType>(CDS->getType()))
+         Out << " = ConstantArray::get(";
+       else
+@@ -980,7 +980,7 @@ void CppWriter::printVariableUses(const GlobalVariable *GV) {
+     } else if (const GlobalVariable* gv = dyn_cast<GlobalVariable>(Init)) {
+       nl(Out) << "// Global Variable Declarations"; nl(Out);
+       printVariableHead(gv);
+-      
++
+       nl(Out) << "// Global Variable Definitions"; nl(Out);
+       printVariableBody(gv);
+     } else  {
+diff --git a/lib/Transforms/Makefile b/lib/Transforms/Makefile
+index c390517..ceb8377 100644
+--- a/lib/Transforms/Makefile
++++ b/lib/Transforms/Makefile
+@@ -8,7 +8,7 @@
+ ##===----------------------------------------------------------------------===##
+ 
+ LEVEL = ../..
+-PARALLEL_DIRS = Utils Instrumentation Scalar InstCombine IPO Vectorize Hello ObjCARC
++PARALLEL_DIRS = Utils Instrumentation Scalar InstCombine IPO Vectorize Hello ObjCARC PrivilegeSeparation
+ 
+ include $(LEVEL)/Makefile.config
+ 
+diff --git a/lib/Transforms/PrivilegeSeparation/Makefile b/lib/Transforms/PrivilegeSeparation/Makefile
+new file mode 100644
+index 0000000..230aa72
+--- /dev/null
++++ b/lib/Transforms/PrivilegeSeparation/Makefile
+@@ -0,0 +1,15 @@
++##===- lib/Transforms/IPO/Makefile -------------------------*- Makefile -*-===##
++#
++#                     The LLVM Compiler Infrastructure
++#
++# This file is distributed under the University of Illinois Open Source
++# License. See LICENSE.TXT for details.
++#
++##===----------------------------------------------------------------------===##
++
++LEVEL = ../../..
++LIBRARYNAME = LLVMPrivilegeSeparation
++BUILD_ARCHIVE = 1
++
++include $(LEVEL)/Makefile.common
++
+diff --git a/lib/Transforms/PrivilegeSeparation/PrivilegeSeparationOnModule.cpp b/lib/Transforms/PrivilegeSeparation/PrivilegeSeparationOnModule.cpp
+new file mode 100644
+index 0000000..d86a215
+--- /dev/null
++++ b/lib/Transforms/PrivilegeSeparation/PrivilegeSeparationOnModule.cpp
+@@ -0,0 +1,502 @@
++#define DEBUG_TYPE "PrivilegeSeparationOnModule"
++#include <string>
++#include <vector>
++#include <sstream>
++#include <fstream>
++#include "llvm/Pass.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Attributes.h"
++#include "llvm/ADT/ilist.h"
++#include "llvm/Transforms/Utils/Cloning.h"
++#include "llvm/Transforms/PrivilegeSeparation.h"
++using namespace llvm;
++
++namespace {
++
++class PrivilegeSeparationOnModule : public ModulePass {
++    public:
++        static char ID;
++        PrivilegeSeparationOnModule() : ModulePass(ID) {}
++        virtual bool runOnModule(Module &M) {
++	    std::bitset<NUM_OF_LEVELS> isItUsedFun (0);
++	    std::bitset<NUM_OF_LEVELS> isItUsedVar (0);
++	    isItUsedFun.set(NUM_OF_LEVELS-1,1);
++	    isItUsedVar.set(NUM_OF_LEVELS-1,1);
++            runOnFunctions(M, &isItUsedFun);
++            runOnGlobalVariables(M, &isItUsedVar);
++            generateLinkScript(&isItUsedFun, &isItUsedVar);
++            return true;
++        }
++        void runOnGlobalVariables(Module &M,std::bitset<NUM_OF_LEVELS>* isItUsedVar) {
++            std::vector<GlobalVariable*>* my_list[NUM_OF_LEVELS];
++            std::vector<GlobalVariable*>* to_delete[NUM_OF_LEVELS];
++	                for (unsigned int i = 0; i< NUM_OF_LEVELS; ++i) {
++                my_list[i] = NULL;
++                to_delete[i] = NULL;
++            }
++            Module::GlobalListType &GVlist = M.getGlobalList();
++            Module::global_iterator GVIterCurr = GVlist.begin();
++            Module::global_iterator GVIterEnd = GVlist.end();
++            ValueToValueMapTy VMap;
++            for (; GVIterCurr != GVIterEnd; ++GVIterCurr) {
++                GlobalVariable &GV = *GVIterCurr;
++                unsigned int privSep = GV.getPrivilegeSeparation();
++                GlobalVariable *GV2 = new GlobalVariable(
++                                GVIterCurr->getType()->getElementType(),
++                                GVIterCurr->isConstant(), GVIterCurr->getLinkage(),
++                                (Constant*) 0, GVIterCurr->getName(),
++                                GVIterCurr->getThreadLocalMode(),
++                                GVIterCurr->getType()->getAddressSpace());
++                GV2->copyAttributesFrom(GVIterCurr);
++                VMap[GVIterCurr] = GV2;
++                if (my_list[privSep] == NULL)
++                    my_list[privSep] = new std::vector<GlobalVariable*>();
++                my_list[privSep]->push_back(GV2);
++                if (to_delete[privSep] == NULL)
++                    to_delete[privSep] = new std::vector<GlobalVariable*>();
++                to_delete[privSep]->push_back(&GV);
++            }
++            for (Module::const_global_iterator I = M.global_begin(), E = M.global_end();
++                    I != E; ++I) {
++                 GlobalVariable *GV = cast<GlobalVariable>(VMap[I]);
++                 if (I->hasInitializer())
++                   GV->setInitializer(MapValue(I->getInitializer(), VMap));
++            }
++            //Remove of the Global Variables from the module and clone them into other structure
++            for (unsigned int l = 0; l < NUM_OF_LEVELS; ++l) {
++                if (to_delete[l] != NULL) {
++                    for (unsigned int j = 0; j < to_delete[l]->size(); ++j) {
++                        if (to_delete[l] != NULL) {
++                            to_delete[l]->at(j)->replaceAllUsesWith(my_list[l]->at(j));
++                            to_delete[l]->at(j)->dropAllReferences();
++                            to_delete[l]->at(j)->eraseFromParent();
++                        }
++                    }
++                }
++            }
++            for (unsigned int i = 0; i < NUM_OF_LEVELS; ++i) {
++                if(my_list[i] != NULL) {
++                    for (unsigned int j=0; j< my_list[i]->size(); ++j) {
++                        std::stringstream ss;
++                        ss << i;
++                        std::string sec = ".dat_ps_" + ss.str();
++                        StringRef sec_ref = StringRef(sec);
++                        my_list[i]->at(j)->setSection(sec_ref);
++			isItUsedVar->set(i,1);
++                        M.getGlobalList().push_back(my_list[i]->at(j));
++                    }
++                }
++            }
++            for (unsigned int i = 0; i< NUM_OF_LEVELS; ++i) {
++                if (my_list[i] != NULL)
++                    delete my_list[i];
++                if (to_delete[i] != NULL)
++                    delete to_delete[i];
++            }
++        }
++        void runOnFunctions(Module &M, std::bitset<NUM_OF_LEVELS>* isItUsedFun) {
++            std::vector<Function*>* my_list[NUM_OF_LEVELS];
++            std::vector<Function*>* to_delete[NUM_OF_LEVELS];
++            for (unsigned int i = 0; i<NUM_OF_LEVELS; ++i) {
++                my_list[i] = NULL;
++                to_delete[i] = NULL;
++            }
++            Module::FunctionListType &funlist = M.getFunctionList();
++            Module::iterator funIterCurr = funlist.begin();
++            Module::iterator funIterEnd = funlist.end();
++            for( ; funIterCurr != funIterEnd; ++funIterCurr) {
++                Function &fun = *funIterCurr;
++                AttributeSet cuAttrSet = fun.getAttributes();
++                if (cuAttrSet.hasAttribute(AttributeSet::FunctionIndex, "privilege-separation")) {
++                    Attribute att = cuAttrSet.getAttribute(AttributeSet::FunctionIndex, "privilege-separation");
++                    std::string value_str = att.getValueAsString().str();
++                    int value_int = atoi(value_str.c_str());
++                    ValueToValueMapTy VMap;
++                    Function *fun2 = CloneFunction(&fun, VMap, false);
++                    if (my_list[value_int] == NULL)
++                        my_list[value_int] = new std::vector<Function*>();
++                    my_list[value_int]->push_back(fun2);
++                    if (to_delete[value_int] == NULL)
++                        to_delete[value_int] = new std::vector<Function*>();
++                    to_delete[value_int]->push_back(&fun);
++                }
++                else {
++                    std::stringstream ss;
++                    ss << NUM_OF_LEVELS-1;
++                    std::string sec = ".fun_ps_" + ss.str();
++                    fun.setSection(sec);
++                }
++            }
++            //Remove of the functions from the module and clone them into other structure
++            for (unsigned int l = 0; l < NUM_OF_LEVELS; ++l) {
++                if (to_delete[l] != NULL) {
++                    for (unsigned int j = 0; j < to_delete[l]->size(); ++j) {
++                            if (to_delete[l] != NULL) {
++                                to_delete[l]->at(j)->deleteBody();
++                                to_delete[l]->at(j)->replaceAllUsesWith(my_list[l]->at(j));
++                                to_delete[l]->at(j)->dropAllReferences();
++                                to_delete[l]->at(j)->eraseFromParent();
++                            }
++                    }
++                }
++            }
++            //Re-insert functions into the module
++            for (unsigned int i = 0; i < NUM_OF_LEVELS; ++i) {
++                if (my_list[i] != NULL) {
++                    for (unsigned int j = 0; j< my_list[i]->size(); ++j) {
++                        std::stringstream ss;
++                        ss << i;
++                        std::string sec = ".fun_ps_" + ss.str();
++                        StringRef sec_ref = StringRef(sec);
++                        my_list[i]->at(j)->setSection(sec_ref);
++			isItUsedFun->set(i,1);
++                        M.getFunctionList().push_back(my_list[i]->at(j));
++                    }
++                }
++            }
++            //Loop to delete all the created elements
++            for (unsigned int i = 0; i< NUM_OF_LEVELS; ++i) {
++                if (my_list[i] != NULL)
++                    delete my_list[i];
++                if (to_delete[i] != NULL)
++                    delete to_delete[i];
++            }
++        }
++        void generateLinkScript(std::bitset<NUM_OF_LEVELS>* isItUsedFun, std::bitset<NUM_OF_LEVELS>* isItUsedVar) {
++            std::string begin_script =      "/* Script for -z combreloc: combine and sort reloc sections */\n"
++#ifdef __x86_64__
++                                "OUTPUT_FORMAT(\"elf64-x86-64\", \"elf64-x86-64\",\n"
++                                "              \"elf64-x86-64\")\n"
++                                "OUTPUT_ARCH(i386:x86-64)\n"
++                                "ENTRY(_start)\n"
++                                "SEARCH_DIR(\"/usr/x86_64-pc-linux-gnu/lib64\"); SEARCH_DIR(\"/usr/lib64/binutils/x86_64-pc-linux-gnu/*\"); SEARCH_DIR(\"/usr/local/lib64\"); SEARCH_DIR(\"/lib64\"); SEARCH_DIR(\"/usr/lib64\"); SEARCH_DIR(\"/usr/x86_64-pc-linux-gnu/lib\"); SEARCH_DIR(\"/usr/lib64/binutils/x86_64-pc-linux-gnu/*\"); SEARCH_DIR(\"/usr/local/lib\"); SEARCH_DIR(\"/lib\"); SEARCH_DIR(\"/usr/lib\");\n"
++                                "SECTIONS\n"
++                                "{\n"
++                                "  /* Read-only sections, merged into text segment: */\n"
++                                "  PROVIDE (__executable_start = SEGMENT_START(\"text-segment\", 0x400000)); . = SEGMENT_START(\"text-segment\", 0x400000) + SIZEOF_HEADERS;\n"
++#elif __i386__
++                                "OUTPUT_FORMAT(\"elf32-i386\", \"elf32-i386\",\n"
++                                "              \"elf32-i386\")\n"
++                                "OUTPUT_ARCH(i386)\n"
++                                "ENTRY(_start)\n"
++                                "SEARCH_DIR(\"/usr/i686-pc-linux-gnu/lib\"); SEARCH_DIR(\"/usr/lib/binutils/i686-pc-linux-gnu/*\"); SEARCH_DIR(\"/usr/local/lib\"); SEARCH_DIR(\"/lib\"); SEARCH_DIR(\"/usr/lib\");\n"
++                                "SECTIONS\n"
++                                "{\n"
++                                "  /* Read-only sections, merged into text segment: */\n"
++                                "  PROVIDE (__executable_start = SEGMENT_START(\"text-segment\", 0x08048000)); . = SEGMENT_START(\"text-segment\", 0x08048000) + SIZEOF_HEADERS;\n"
++#endif
++                                "  .interp         : { *(.interp) } : text : interp \n"
++                                "  .note.gnu.build-id : { *(.note.gnu.build-id) } :text\n"
++                                "  .hash           : { *(.hash) }\n"
++                                "  .gnu.hash       : { *(.gnu.hash) }\n"
++                                "  .dynsym         : { *(.dynsym) }\n"
++                                "  .dynstr         : { *(.dynstr) }\n"
++                                "  .gnu.version    : { *(.gnu.version) }\n"
++                                "  .gnu.version_d  : { *(.gnu.version_d) }\n"
++                                "  .gnu.version_r  : { *(.gnu.version_r) }\n"
++#ifdef __x86_64__
++                                "  .rela.dyn       :\n"
++                                "    {\n"
++                                "      *(.rela.init)\n"
++                                "      *(.rela.text .rela.text.* .rela.gnu.linkonce.t.*)\n"
++                                "      *(.rela.fini)\n"
++                                "      *(.rela.rodata .rela.rodata.* .rela.gnu.linkonce.r.*)\n"
++                                "      *(.rela.data .rela.data.* .rela.gnu.linkonce.d.*)\n"
++                                "      *(.rela.tdata .rela.tdata.* .rela.gnu.linkonce.td.*)\n"
++                                "      *(.rela.tbss .rela.tbss.* .rela.gnu.linkonce.tb.*)\n"
++                                "      *(.rela.ctors)\n"
++                                "      *(.rela.dtors)\n"
++                                "      *(.rela.got)\n"
++                                "      *(.rela.bss .rela.bss.* .rela.gnu.linkonce.b.*)\n"
++                                "      *(.rela.ldata .rela.ldata.* .rela.gnu.linkonce.l.*)\n"
++                                "      *(.rela.lbss .rela.lbss.* .rela.gnu.linkonce.lb.*)\n"
++                                "      *(.rela.lrodata .rela.lrodata.* .rela.gnu.linkonce.lr.*)\n"
++                                "      *(.rela.ifunc)\n"
++                                "    }\n"
++                                "  .rela.plt       :\n"
++                                "    {\n"
++                                "      *(.rela.plt)\n"
++                                "      PROVIDE_HIDDEN (__rela_iplt_start = .);\n"
++                                "      *(.rela.iplt)\n"
++                                "      PROVIDE_HIDDEN (__rela_iplt_end = .);\n"
++                                "    }\n"
++#elif __i386__
++                                "  .rel.dyn       :\n"
++                                "    {\n"
++                                "      *(.rel.init)\n"
++                                "      *(.rel.text .rel.text.* .rel.gnu.linkonce.t.*)\n"
++                                "      *(.rel.fini)\n"
++                                "      *(.rel.rodata .rel.rodata.* .rel.gnu.linkonce.r.*)\n"
++                                "      *(.rel.data .rel.data.* .rel.gnu.linkonce.d.*)\n"
++                                "      *(.rel.tdata .rel.tdata.* .rel.gnu.linkonce.td.*)\n"
++                                "      *(.rel.tbss .rel.tbss.* .rel.gnu.linkonce.tb.*)\n"
++                                "      *(.rel.ctors)\n"
++                                "      *(.rel.dtors)\n"
++                                "      *(.rel.got)\n"
++                                "      *(.rel.bss .rel.bss.* .rel.gnu.linkonce.b.*)\n"
++                                "      *(.rel.ldata .rel.ldata.* .rel.gnu.linkonce.l.*)\n"
++                                "      *(.rel.lbss .rel.lbss.* .rel.gnu.linkonce.lb.*)\n"
++                                "      *(.rel.lrodata .rel.lrodata.* .rel.gnu.linkonce.lr.*)\n"
++                                "      *(.rel.ifunc)\n"
++                                "    }\n"
++                                "  .rel.plt       :\n"
++                                "    {\n"
++                                "      *(.rel.plt)\n"
++                                "      PROVIDE_HIDDEN (__rel_iplt_start = .);\n"
++                                "      *(.rel.iplt)\n"
++                                "      PROVIDE_HIDDEN (__rel_iplt_end = .);\n"
++                                "    }\n"
++#endif
++                                "  .init           :\n"
++                                "  {\n"
++                                "    KEEP (*(SORT_NONE(.init)))\n"
++                                "  }\n"
++                                "  .plt            : { *(.plt) *(.iplt) }\n";
++std::string text_section =      "  . = ALIGN (CONSTANT (MAXPAGESIZE)) - ((CONSTANT (MAXPAGESIZE) - .) & (CONSTANT (MAXPAGESIZE) - 1));\n"
++                                "  .text :\n"
++                                "  {\n"
++                                "    *(.text.unlikely .text.*_unlikely)\n"
++                                "    *(.text.exit .text.exit.*)\n"
++                                "    *(.text.startup .text.startup.*)\n"
++                                "    *(.text.hot .text.hot.*)\n"
++                                "    *(.text .stub .text.* .gnu.linkonce.t.*)\n"
++                                "    /* .gnu.warning sections are handled specially by elf32.em.  */\n"
++                                "    *(.gnu.warning)\n"
++                                "  } : text\n";
++std::string before_data =       "  . = . + 0x2000; \n"
++                                "  .fini           :\n"
++                                "  {\n"
++                                "    KEEP (*(SORT_NONE(.fini)))\n"
++                                "  } : text\n"
++                                "  PROVIDE (__etext = .);\n"
++                                "  PROVIDE (_etext = .);\n"
++                                "  PROVIDE (etext = .);\n"
++                                "  .rodata         : { *(.rodata .rodata.* .gnu.linkonce.r.*) } : text\n"
++                                "  .rodata1        : { *(.rodata1) }\n"
++                                "  .eh_frame_hdr : { *(.eh_frame_hdr) }\n"
++                                "  .eh_frame       : ONLY_IF_RO { KEEP (*(.eh_frame)) }\n"
++                                "  .gcc_except_table   : ONLY_IF_RO { *(.gcc_except_table\n"
++                                "  .gcc_except_table.*) }\n"
++                                "  /* These sections are generated by the Sun/Oracle C++ compiler.  */\n"
++                                "  .exception_ranges   : ONLY_IF_RO { *(.exception_ranges\n"
++                                "  .exception_ranges*) }\n"
++                                "  /* Adjust the address for the data segment.  We want to adjust up to\n"
++                                "     the same address within the page on the next page up.  */\n"
++                                "  . = ALIGN (CONSTANT (MAXPAGESIZE)) - ((CONSTANT (MAXPAGESIZE) - .) & (CONSTANT (MAXPAGESIZE) - 1)); . = DATA_SEGMENT_ALIGN (CONSTANT (MAXPAGESIZE), CONSTANT (COMMONPAGESIZE));\n"
++                                "  /* Exception handling  */\n"
++                                "  .eh_frame       : ONLY_IF_RW { KEEP (*(.eh_frame)) }\n"
++                                "  .gcc_except_table   : ONLY_IF_RW { *(.gcc_except_table .gcc_except_table.*) }\n"
++                                "  .exception_ranges   : ONLY_IF_RW { *(.exception_ranges .exception_ranges*) }\n"
++                                "  /* Thread Local Storage sections  */\n"
++                                "  .tdata          : { *(.tdata .tdata.* .gnu.linkonce.td.*) }\n"
++                                "  .tbss           : { *(.tbss .tbss.* .gnu.linkonce.tb.*) *(.tcommon) }\n"
++                                "  .preinit_array     :\n"
++                                "  {\n"
++                                "    PROVIDE_HIDDEN (__preinit_array_start = .);\n"
++                                "    KEEP (*(.preinit_array))\n"
++                                "    PROVIDE_HIDDEN (__preinit_array_end = .);\n"
++                                "  }\n"
++                                "  .init_array     :\n"
++                                "  {\n"
++                                "    PROVIDE_HIDDEN (__init_array_start = .);\n"
++                                "    KEEP (*(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*)))\n"
++                                "    KEEP (*(.init_array))\n"
++                                "    KEEP (*(EXCLUDE_FILE (*crtbegin.o *crtbegin?.o *crtbeginTS.o *crtend.o *crtend?.o ) .ctors))\n"
++                                "    PROVIDE_HIDDEN (__init_array_end = .);\n"
++                                "  } : data\n"
++                                "  .fini_array     :\n"
++                                "  {\n"
++                                "    PROVIDE_HIDDEN (__fini_array_start = .);\n"
++                                "    KEEP (*(SORT_BY_INIT_PRIORITY(.fini_array.*) SORT_BY_INIT_PRIORITY(.dtors.*)))\n"
++                                "    KEEP (*(.fini_array))\n"
++                                "    KEEP (*(EXCLUDE_FILE (*crtbegin.o *crtbegin?.o *crtbeginTS.o *crtend.o *crtend?.o ) .dtors))\n"
++                                "    PROVIDE_HIDDEN (__fini_array_end = .);\n"
++                                "  }\n"
++                                "  .ctors          :\n"
++                                "  {\n"
++                                "    /* gcc uses crtbegin.o to find the start of\n"
++                                "       the constructors, so we make sure it is\n"
++                                "       first.  Because this is a wildcard, it\n"
++                                "       doesn't matter if the user does not\n"
++                                "       actually link against crtbegin.o; the\n"
++                                "       linker won't look for a file to match a\n"
++                                "       wildcard.  The wildcard also means that it\n"
++                                "       doesn't matter which directory crtbegin.o\n"
++                                "       is in.  */\n"
++                                "    KEEP (*crtbegin.o(.ctors))\n"
++                                "    KEEP (*crtbegin?.o(.ctors))\n"
++                                "    KEEP (*crtbeginTS.o(.ctors))\n"
++                                "    /* We don't want to include the .ctor section from\n"
++                                "       the crtend.o file until after the sorted ctors.\n"
++                                "       The .ctor section from the crtend file contains the\n"
++                                "       end of ctors marker and it must be last */\n"
++                                "    KEEP (*(EXCLUDE_FILE (*crtend.o *crtend?.o ) .ctors))\n"
++                                "    KEEP (*(SORT(.ctors.*)))\n"
++                                "    KEEP (*(.ctors))\n"
++                                "  }\n"
++                                "  .dtors          :\n"
++                                "  {\n"
++                                "    KEEP (*crtbegin.o(.dtors))\n"
++                                "    KEEP (*crtbegin?.o(.dtors))\n"
++                                "    KEEP (*crtbeginTS.o(.dtors))\n"
++                                "    KEEP (*(EXCLUDE_FILE (*crtend.o *crtend?.o ) .dtors))\n"
++                                "    KEEP (*(SORT(.dtors.*)))\n"
++                                "    KEEP (*(.dtors))\n"
++                                "  }\n"
++                                "  .jcr            : { KEEP (*(.jcr)) }\n"
++                                "  .data.rel.ro : { *(.data.rel.ro.local* .gnu.linkonce.d.rel.ro.local.*) *(.data.rel.ro .data.rel.ro.* .gnu.linkonce.d.rel.ro.*) }\n"
++                                "  .dynamic        : { *(.dynamic) } : data : dynamic\n"
++                                "  .got            : { *(.got) *(.igot) }\n"
++                                "  . = DATA_SEGMENT_RELRO_END (SIZEOF (.got.plt) >= 24 ? 24 : 0, .);\n"
++                                "  .got.plt        : { *(.got.plt)  *(.igot.plt) }\n"
++                                "  . = ALIGN (CONSTANT (MAXPAGESIZE)) - ((CONSTANT (MAXPAGESIZE) - .) & (CONSTANT (MAXPAGESIZE) - 1));\n"
++                                "  .data :\n"
++                                "  {\n"
++                                "    *(.data .data.* .gnu.linkonce.d.*)\n"
++                                "    SORT(CONSTRUCTORS)\n"
++                                "  } : data\n";
++std::string after_data =        "  .data1          : { *(.data1) } : data \n"
++                                "  _edata = .; PROVIDE (edata = .);\n"
++                                "  . = .;\n"
++                                "  __bss_start = .;\n"
++                                "  .bss            :\n"
++                                "  {\n"
++                                "   *(.dynbss)\n"
++                                "   *(.bss .bss.* .gnu.linkonce.b.*)\n"
++                                "   *(COMMON)\n"
++                                "   /* Align here to ensure that the .bss section occupies space up to\n"
++                                "      _end.  Align after .bss to ensure correct alignment even if the\n"
++                                "      .bss section disappears because there are no input sections.\n"
++                                "      FIXME: Why do we need it? When there is no .bss section, we don't\n"
++                                "      pad the .data section.  */\n"
++                                "   . = ALIGN(. != 0 ? 64 / 8 : 1);\n"
++                                "  }\n"
++                                "  .lbss   :\n"
++                                "  {\n"
++                                "    *(.dynlbss)\n"
++                                "    *(.lbss .lbss.* .gnu.linkonce.lb.*)\n"
++                                "    *(LARGE_COMMON)\n"
++                                "  }\n"
++                                "  . = ALIGN(64 / 8);\n"
++                                "  .lrodata   ALIGN(CONSTANT (MAXPAGESIZE)) + (. & (CONSTANT (MAXPAGESIZE) - 1)) :\n"
++                                "  {\n"
++                                "    *(.lrodata .lrodata.* .gnu.linkonce.lr.*)\n"
++                                "  }\n"
++                                "  .ldata   ALIGN(CONSTANT (MAXPAGESIZE)) + (. & (CONSTANT (MAXPAGESIZE) - 1)) :\n"
++                                "  {\n"
++                                "    *(.ldata .ldata.* .gnu.linkonce.l.*)\n"
++                                "    . = ALIGN(. != 0 ? 64 / 8 : 1);\n"
++                                "  }\n"
++                                "  . = ALIGN(64 / 8);\n"
++                                "  _end = .; PROVIDE (end = .);\n"
++                                "  . = DATA_SEGMENT_END (.);\n"
++                                "  /* Stabs debugging sections.  */\n"
++                                "  .stab          0 : { *(.stab) }\n"
++                                "  .stabstr       0 : { *(.stabstr) }\n"
++                                "  .stab.excl     0 : { *(.stab.excl) }\n"
++                                "  .stab.exclstr  0 : { *(.stab.exclstr) }\n"
++                                "  .stab.index    0 : { *(.stab.index) }\n"
++                                "  .stab.indexstr 0 : { *(.stab.indexstr) }\n"
++                                "  .comment       0 : { *(.comment) }\n"
++                                "  /* DWARF debug sections.\n"
++                                "     Symbols in the DWARF debugging sections are relative to the beginning\n"
++                                "     of the section so we begin them at 0.  */\n"
++                                "  /* DWARF 1 */\n"
++                                "  .debug          0 : { *(.debug) }\n"
++                                "  .line           0 : { *(.line) }\n"
++                                "  /* GNU DWARF 1 extensions */\n"
++                                "  .debug_srcinfo  0 : { *(.debug_srcinfo) }\n"
++                                "  .debug_sfnames  0 : { *(.debug_sfnames) }\n"
++                                "  /* DWARF 1.1 and DWARF 2 */\n"
++                                "  .debug_aranges  0 : { *(.debug_aranges) }\n"
++                                "  .debug_pubnames 0 : { *(.debug_pubnames) }\n"
++                                "  /* DWARF 2 */\n"
++                                "  .debug_info     0 : { *(.debug_info .gnu.linkonce.wi.*) }\n"
++                                "  .debug_abbrev   0 : { *(.debug_abbrev) }\n"
++                                "  .debug_line     0 : { *(.debug_line) }\n"
++                                "  .debug_frame    0 : { *(.debug_frame) }\n"
++                                "  .debug_str      0 : { *(.debug_str) }\n"
++                                "  .debug_loc      0 : { *(.debug_loc) }\n"
++                                "  .debug_macinfo  0 : { *(.debug_macinfo) }\n"
++                                "  /* SGI/MIPS DWARF 2 extensions */\n"
++                                "  .debug_weaknames 0 : { *(.debug_weaknames) }\n"
++                                "  .debug_funcnames 0 : { *(.debug_funcnames) }\n"
++                                "  .debug_typenames 0 : { *(.debug_typenames) }\n"
++                                "  .debug_varnames  0 : { *(.debug_varnames) }\n"
++                                "  /* DWARF 3 */\n"
++                                "  .debug_pubtypes 0 : { *(.debug_pubtypes) }\n"
++                                "  .debug_ranges   0 : { *(.debug_ranges) }\n"
++                                "  /* DWARF Extension.  */\n"
++                                "  .debug_macro    0 : { *(.debug_macro) }\n"
++                                "  .gnu.attributes 0 : { KEEP (*(.gnu.attributes)) }\n"
++                                "  /DISCARD/ : { *(.note.GNU-stack) *(.gnu_debuglink) *(.gnu.lto_*) }\n"
++                                "}\n";
++std::string phdrs_front =       "  PHDRS\n"
++                                "  {\n"
++                                "    headers PT_PHDR PHDRS ;\n"
++                                "    interp PT_INTERP ; \n"
++                                "    text PT_LOAD FILEHDR PHDRS ; \n";
++std::string phdrs_data =        "    data PT_LOAD ;\n";
++std::string phdrs_back =        "    dynamic PT_DYNAMIC ; \n"
++                                "  }\n";
++            std::ofstream script;
++            script.open("ps_link_script.ld");
++            script << begin_script;
++            script << text_section;
++	    unsigned int last_i=-1;
++            for (unsigned int i=0; i< NUM_OF_LEVELS; ++i) {
++	   	if (isItUsedFun->test(i)) { 
++			/*if ( i == 0 || last_i == -1)
++			    script << "  . = . + CONSTANT (COMMONPAGESIZE) - SIZEOF(.text);\n";
++			else
++			    script << "  . = . + CONSTANT (COMMONPAGESIZE) - SIZEOF(.fun_ps_"<< last_i<<");\n";*/
++			script << "  . = . + 0x1000; \n";
++			script << "  .fun_ps_" << i << " :\n";
++			script << "  {\n";
++			script << "    *(fun_ps_"<< i << ")\n";
++			script << "  } : fun_ps_"<< i <<"\n";
++			last_i = i;
++		}			
++            }
++            script << "  . = . + CONSTANT (COMMONPAGESIZE) - SIZEOF (.fun_ps_"<< last_i <<");\n";
++            script << before_data;
++	    last_i=-1;
++            for (unsigned int i=0; i< NUM_OF_LEVELS; ++i) {
++		if (isItUsedVar->test(i)){
++			/*if ( i == 0 || last_i == -1)
++			    script << "  . = . + CONSTANT (COMMONPAGESIZE) - SIZEOF(.data);\n";
++			else
++			    script << "  . = . + CONSTANT (COMMONPAGESIZE) - SIZEOF(.dat_ps_"<< last_i <<");\n";*/
++			script << "  . = . + 0x1000;\n";
++			script << "  .dat_ps_" << i << " :\n";
++			script << "  {\n";
++			script << "    *(dat_ps_"<< i << ")\n";
++			script << "  } : dat_ps_"<< i <<"\n";
++			last_i = i;
++		}
++            }
++            script << "  . = . + CONSTANT (COMMONPAGESIZE) - SIZEOF(.dat_ps_"<< last_i <<");\n";
++            script << after_data;
++            script << phdrs_front;
++            for (unsigned int i=0; i< NUM_OF_LEVELS; ++i) {
++	    	if (isItUsedFun->test(i))
++                	script << "    fun_ps_"<<i<<" PT_LOAD ;\n";
++            }
++            script << phdrs_data;
++            for (unsigned int i=0; i< NUM_OF_LEVELS; ++i) {
++	    	if (isItUsedVar->test(i))
++                	script << "    dat_ps_"<<i<<" PT_LOAD ;\n";
++            }
++            script << phdrs_back;
++            script.close();
++            return;
++        }
++    };
++}
++char PrivilegeSeparationOnModule::ID = 0;
++static RegisterPass<PrivilegeSeparationOnModule> X("PrivilegeSeparationOnModule", "PrivilegeSeparation On Module", false, false);
++
++
+diff --git a/lib/Transforms/PrivilegeSeparation/SysCallInsertion.cpp b/lib/Transforms/PrivilegeSeparation/SysCallInsertion.cpp
+new file mode 100644
+index 0000000..f041079
+--- /dev/null
++++ b/lib/Transforms/PrivilegeSeparation/SysCallInsertion.cpp
+@@ -0,0 +1,254 @@
++#define DEBUG_TYPE "SysCallInsertion"
++#include "llvm/Pass.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/Analysis/CallGraph.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/DataLayout.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++#include <vector>
++#include <iostream>
++#define SYSCALLNUM 352
++using namespace llvm;
++
++namespace {
++class SysCallInsertion : public ModulePass{
++    public:
++        static char ID;
++        SysCallInsertion() : ModulePass(ID) {}
++        virtual bool runOnModule(Module &M) {
++            //std::vector<CallSite> *CallSites = new std::vector<CallSite>();
++            std::vector<Instruction *> *visited = NULL;
++            Instruction *I = NULL;
++            while ((I = getList(visited, M)) != NULL ) {
++                if (!visited) visited = new std::vector<Instruction *> ();
++                visited->push_back(I);
++                CallSite CS (cast<Value>(I));
++                Function *caller = CS.getCaller();
++                Function *callee = CS.getCalledFunction();
++                const char *cr = caller->getSection();//.c_str();
++                const char *ce = callee->getSection();//.c_str();
++                int cr_lev = atoi(cr+8);
++                int ce_lev = atoi(ce+8);
++                if (ce_lev >= cr_lev) {
++                    continue;
++                }
++                //Save the call instruction and the next instruction
++                //Split function in multiple basic block
++                BasicBlock *head = I->getParent();
++                BasicBlock *tail = head->splitBasicBlock(I);
++                TerminatorInst *headOldTerm = head->getTerminator();
++                //tail->getInstList().pop_front();
++                //headOldTerm->moveBefore(I);
++                I->removeFromParent();
++                //Crete another basic block for the true case of the if I want insert
++                BasicBlock *label_if_then = BasicBlock::Create(M.getContext(), "if.then",head->getParent(), tail);
++                //Remove the call instruction from the basicblock
++                //Re-Add the call instruction I removed from the original code
++
++                BranchInst::Create(tail, label_if_then);
++                //Syscall Prototype and pointer
++                std::vector<Type*> FuncTy_2_args;
++                FuncTy_2_args.push_back(IntegerType::get(M.getContext(), 32));
++                FuncTy_2_args.push_back(IntegerType::get(M.getContext(), 32));
++                FunctionType *FuncTy_2 = FunctionType::get(IntegerType::get(M.getContext(), 32), FuncTy_2_args, true);
++                PointerType *PointerTy_1 = PointerType::get(FuncTy_2, 0);
++
++                //Constant Definition
++                ConstantInt* num_syscall = ConstantInt::get(M.getContext(), APInt(32, SYSCALLNUM, false));
++                ConstantInt* num_caller = ConstantInt::get(M.getContext(), APInt(32, StringRef(cr+8),10));
++                ConstantInt* num_callee  = ConstantInt::get(M.getContext(), APInt(32, StringRef(ce+8),10));
++                ConstantInt* one = ConstantInt::get(M.getContext(), APInt(32, StringRef("1"),10));
++                ConstantInt* mone = ConstantInt::get(M.getContext(), APInt(32, StringRef("-1"),10));
++
++                //Creating template for the exit call to add
++                std::vector<Type *> exit_ty_args;
++                exit_ty_args.push_back(IntegerType::get(M.getContext(), 32));
++                FunctionType* exit_ty = FunctionType::get(
++                        Type::getVoidTy(M.getContext()),
++                        exit_ty_args,
++                        false);
++                Function* func_exit = M.getFunction("_Z12exit_wrapperv");
++                bool isNotExist = false;
++                if (!func_exit) {
++                   func_exit = M.getFunction("exit_wrapper");
++                   if (!func_exit) {
++                        func_exit = M.getFunction("exit");
++                        if (!func_exit) {
++                            func_exit = Function::Create(
++                                    exit_ty,
++                                    GlobalValue::ExternalLinkage,
++                                    "exit",
++                                    &M);
++                            func_exit->setCallingConv(CallingConv::C);
++                        }
++                        isNotExist = true;
++                   }
++                }
++                AttributeSet func_exit_PAL;
++                {
++                    SmallVector<AttributeSet, 4> Attrs;
++                    AttributeSet PAS;
++                    {
++                        AttrBuilder B;
++                        B.addAttribute(Attribute::NoReturn);
++                        PAS = AttributeSet::get(M.getContext(), ~0U, B);
++                    }
++                    Attrs.push_back(PAS);
++                    func_exit_PAL = AttributeSet::get(M.getContext(), Attrs);
++                }
++                func_exit->setAttributes(func_exit_PAL);
++
++                //Creating template for the syscall call to add
++                std::vector<Type*> FuncTy_9_args;
++                FunctionType *FuncTy_9 = FunctionType::get(IntegerType::get(M.getContext(), 32), FuncTy_9_args, true);
++                Function *func_syscall = M.getFunction("syscall");
++                if(!func_syscall){
++                    func_syscall = Function::Create(FuncTy_9, GlobalValue::ExternalLinkage, "syscall", &M);
++                    func_syscall->setCallingConv(CallingConv::C);
++                }
++                AttributeSet func_syscall_PAL;
++                {
++                    SmallVector<AttributeSet, 4> Attrs;
++                    AttributeSet PAS;
++                    {
++                        AttrBuilder B;
++                        PAS = AttributeSet::get(M.getContext(), ~0U, B);
++                    }
++                Attrs.push_back(PAS);
++                func_syscall_PAL = AttributeSet::get(M.getContext(), Attrs);
++                }
++                func_syscall->setAttributes(func_syscall_PAL);
++                //End template syscall
++
++                //Creating Template for the  ???
++                Constant* sys_ptr = ConstantExpr::getCast(Instruction::BitCast,  func_syscall, PointerTy_1);
++                std::vector<Value *> upgrade;
++                upgrade.push_back(num_syscall);
++                upgrade.push_back(num_callee);
++                std::vector<Value *> downgrade;
++                downgrade.push_back(num_syscall);
++                downgrade.push_back(num_caller);
++                if ( isNotExist)
++                    CallInst::Create(func_exit, mone, "", label_if_then->getTerminator());
++                else
++                    CallInst::Create(func_exit, "", label_if_then->getTerminator());
++                CallInst *syscall_downgrade = CallInst::Create(sys_ptr, downgrade, "syscall");
++                tail->getInstList().push_front(syscall_downgrade);
++                tail->getInstList().push_front(I);
++                CallInst *syscall_upgrade  = CallInst::Create(sys_ptr, upgrade, "syscall", head->getTerminator());
++                syscall_upgrade->setCallingConv(CallingConv::C);
++                AttributeSet upgrade_PAL;
++                {
++                    SmallVector<AttributeSet, 4> Attrs;
++                    AttributeSet PAS;
++                    {
++                        AttrBuilder B;
++                        B.addAttribute(Attribute::NoUnwind);
++                        PAS = AttributeSet::get(M.getContext(), Attrs);
++                    }
++                    Attrs.push_back(PAS);
++                    upgrade_PAL = AttributeSet::get(M.getContext(), Attrs);
++                }
++                syscall_upgrade->setAttributes(upgrade_PAL);
++
++                syscall_downgrade->setCallingConv(CallingConv::C);
++                AttributeSet downgrade_PAL;
++                {
++                    SmallVector<AttributeSet, 4> Attrs;
++                    AttributeSet PAS;
++                    {
++                        AttrBuilder B;
++                        B.addAttribute(Attribute::NoUnwind);
++                        PAS = AttributeSet::get(M.getContext(), Attrs);
++                    }
++                    Attrs.push_back(PAS);
++                    downgrade_PAL = AttributeSet::get(M.getContext(), Attrs);
++                }
++                syscall_upgrade->setAttributes(downgrade_PAL);
++
++                //End template
++
++                //Condition
++                ICmpInst* condition = new ICmpInst(head->getTerminator(), ICmpInst::ICMP_NE, syscall_upgrade, one, "cmp");
++                BranchInst *headNewTerm = BranchInst::Create(label_if_then, tail, condition);
++                headNewTerm->setDebugLoc(I->getDebugLoc());
++                ReplaceInstWithInst (headOldTerm, headNewTerm);
++            }
++            if(visited) delete visited;
++            return true;
++        }
++    private:
++        Instruction *getList(std::vector<Instruction*> *visited, Module &M) {
++            Module::FunctionListType &funlist = M.getFunctionList();
++            Module::iterator BCG = funlist.begin();
++            Module::iterator ECG = funlist.end();
++            for (; BCG != ECG; ++BCG) {
++                Function &fun = *BCG;
++                for (Function::iterator BB = fun.begin(), E = fun.end(); BB!=E; ++BB) {
++                    for (BasicBlock::iterator I = BB->begin(), End = BB->end(); I != End; ++I) {
++                        CallSite CS (cast<Value>(I));
++                        if (!CS || isa<IntrinsicInst>(I))
++                            continue;
++                        if (CS.getCalledFunction() && CS.getCalledFunction()->isDeclaration())
++                            continue;
++                        if (CS.getCaller() && CS.getCaller()->isDeclaration())
++                            continue;
++                        if (StringRef(CS.getCaller()->getSection()).compare(".text.startup")== 0
++                                && StringRef(CS.getCaller()->getSection()).compare(".text.startup") == 0)
++                            continue;
++                        if (!CS.getCalledFunction()) continue;
++                        if (isVisited(I, visited))
++                            continue;
++                        std::cout << "Returning callsite: Caller =  " << CS.getCaller()->getName().str() << " Callee = "<< CS.getCalledFunction()->getName().str() << std::endl;
++                        //HERE I have to detect if the call needs to ask for privileges or not
++                        return I;
++                    }
++                }
++            }
++            return NULL;
++        }
++        bool isVisited (Instruction *I, std::vector<Instruction*> *visited) {
++            if (visited == NULL) return false;
++            for (unsigned i = 0; i < visited->size(); ++i) {
++                 CallSite CS (cast<Value>(I));
++                 CallSite Other (cast<Value>(visited->at(i)));
++                 if (CS.getCalledFunction()->getName().compare(Other.getCalledFunction()->getName())== 0
++                         && CS.getCaller()->getName().compare(Other.getCaller()->getName()) == 0){
++                    return true;
++                 }
++            }
++            return false;
++        }
++        void printBasicBlock (Instruction *I) {
++            BasicBlock *b = I->getParent();
++            BasicBlock::iterator b_it = b->begin();
++            BasicBlock::iterator e_it = b->end();
++            std::cout << "DEBUG INFO FOR " << I->getName().str() << std::endl;
++            for (; b_it != e_it; ++b_it) {
++                Instruction *is = b_it;
++                if (TerminatorInst::classof(is))
++                    std::cout << "Instruction : TerminatorInst" << std::endl;
++                else
++                    std::cout << "Instruction : " << is->getName().str() << std::endl;
++            }
++        }
++        void printBasicBlock (BasicBlock *B) {
++            BasicBlock::iterator b_it = B->begin();
++            BasicBlock::iterator e_it = B->end();
++            std::cout << "DEBUG INFO FOR " << B->getParent()->getName().str() << std::endl;
++            for (; b_it != e_it; ++b_it) {
++                Instruction *is = b_it;
++                if (TerminatorInst::classof(is))
++                    std::cout << "Instruction : TerminatorInst" << std::endl;
++                else
++                    std::cout << "Instruction : " << is->getName().str() << std::endl;
++            }
++        }
++
++    };
++}
++
++char SysCallInsertion::ID = 0;
++static RegisterPass<SysCallInsertion> X("SysCallInsertion", "Pass the detects privilege level changes and insert the proper syscall to manage the change", false, false);
+diff --git a/lib/Transforms/PrivilegeSeparation/TaggingPropagation.cpp b/lib/Transforms/PrivilegeSeparation/TaggingPropagation.cpp
+new file mode 100644
+index 0000000..a57f4d8
+--- /dev/null
++++ b/lib/Transforms/PrivilegeSeparation/TaggingPropagation.cpp
+@@ -0,0 +1,221 @@
++#define DEBUG_TYPE "TaggingPropagation"
++#include "llvm/Pass.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/GlobalValue.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/Analysis/CallGraph.h"
++#include "llvm/Transforms/PrivilegeSeparation.h"
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <vector>
++using namespace llvm;
++namespace {
++class TaggingPropagation : public ModulePass {
++    public:
++        static char ID;
++        TaggingPropagation() : ModulePass(ID) {}
++        virtual bool runOnModule(Module &M) {
++            std::vector<CallGraphNode*> *sons = NULL;
++            std::vector<CallGraphNode*> *not_visited = new std::vector<CallGraphNode*>();
++            std::vector<CallGraphNode*> *visited = new std::vector<CallGraphNode*>();
++            std::vector<CallSite> *CallSites = new std::vector<CallSite>();
++            CallGraphNode *root = NULL;
++            CallGraph *CG = new CallGraph(M);
++            CallGraph::iterator BCG = CG->begin();
++            CallGraph::iterator ECG = CG->end();
++            for (; BCG != ECG; ++BCG) {
++                CallGraphNode *CGN = BCG->second;
++                Function *fun = CGN->getFunction();
++                if (!fun || fun->isDeclaration()) continue;
++                AttributeSet cuAttrSet = fun->getAttributes();
++                if (cuAttrSet.hasAttribute(AttributeSet::FunctionIndex, "privilege-separation")) {
++                    Attribute att = cuAttrSet.getAttribute(AttributeSet::FunctionIndex, "privilege-separation");
++                    std::string value_str = att.getValueAsString().str();
++                    fun->setSection(".fun_ps_" + value_str);
++                }
++                if (StringRef(fun->getName().str()).compare("_Z12exit_wrapperv") == 0) {
++                    std::stringstream ss;
++                    ss << NUM_OF_LEVELS - 1;
++                    std::string sec = ".fun_ps_" + ss.str();
++                    StringRef sec_ref = StringRef(sec);
++                    fun->setSection(sec_ref);
++                }
++                if (StringRef(fun->getName().str()).compare("main") == 0) {
++                    root = CGN;
++                    std::stringstream ss;
++                    ss << NUM_OF_LEVELS - 1;
++                    std::string sec = ".fun_ps_" + ss.str();
++                    StringRef sec_ref = StringRef(sec);
++                    root->getFunction()->setSection(sec_ref);
++                }
++                for(Function::iterator BB = fun->begin(), E = fun->end(); BB!= E; ++BB) {
++                    for (BasicBlock::iterator I = BB->begin(), E = BB->end(); I != E; ++I) {
++                        CallSite CS(cast<Value>(I));
++                        if (!CS || isa<IntrinsicInst>(I))
++                            continue;
++                        if (CS.getCalledFunction() && CS.getCalledFunction()->isDeclaration())
++                            continue;
++                        if (CS.getCaller() && CS.getCaller()->isDeclaration())
++                            continue;
++                        if (StringRef(CS.getCaller()->getSection()).compare(".text.startup") == 0 &&
++                                StringRef(CS.getCaller()->getSection()).compare(".text.startup") == 0)
++                            continue;
++                        CallSites->push_back(CS);
++                    }
++                }
++            }
++            while(!isPropagated(CG)) {
++                not_visited->push_back(root);
++                while(!not_visited->empty()) {
++                    CallGraphNode *current = not_visited->back();
++                    not_visited->pop_back();
++                    /*Check if the parents of the current node have all a tag */
++                    int level = -1;
++                    if (!isAlreadyTagged(current)){
++                        if (is_all_parents_tagged(current, CallSites, &level)) {
++                            //case in which I can tag the function
++                            Function *cur = current->getFunction();
++                            std::stringstream ss;
++                            ss << level;
++                            std::string sec = ".fun_ps_" + ss.str();
++                            StringRef sec_ref = StringRef(sec);
++                            cur->setSection(sec_ref);
++                            visited->push_back(current);
++                            //once the function is tagged I can put all the childs in the to visit
++                            //if there are any
++                            sons = get_list_sons(current);
++                            while(!sons->empty()) {
++                                if (std::find(visited->begin(), visited->end(), sons->back()) ==  visited->end())
++                                    not_visited->push_back(sons->back());
++                                sons->pop_back();
++                            }
++                        }
++                        else {
++                            //case where It's not ready to elaborate the node due some missing dependencies
++                            //so the idea is that we put again in the queue the node and we hopefully next time
++                            //we will be able to tag it
++                            not_visited->insert(not_visited->begin(),current);
++                        }
++                    }
++                    else {
++                        //case in which everything is already done, here
++                        //I can consider only the childs node
++                        visited->push_back(current);
++                        sons = get_list_sons(current);
++                        while(!sons->empty()){
++                            if (std::find(visited->begin(), visited->end(), sons->back()) == visited->end())
++                                not_visited->push_back(sons->back());
++                            sons->pop_back();
++                        }
++                    }
++                }
++            }
++            print_tagging_propagation_status(CG);
++            delete sons;
++            delete CallSites;
++            delete not_visited;
++            delete visited;
++            delete CG;
++            return true;
++        }
++
++    private:
++        bool isAlreadyTagged (CallGraphNode *node) {
++            Function *child = node->getFunction();
++            if (StringRef(child->getSection()).find(".fun_ps_") != std::string::npos) return true;
++            else return false;
++        }
++        /*
++         *  Function to control if all the parents have a valid tag
++         *
++         */
++        bool is_all_parents_tagged(CallGraphNode *node, std::vector<CallSite> *CallSites, int *level) {
++            Function *child = node->getFunction();
++            std::vector<Function*> *parents = new std::vector<Function*>();
++            for(unsigned i = 0; i != CallSites->size(); ++i) {
++                Function *caller = CallSites->at(i).getCaller();
++                Function *callee = CallSites->at(i).getCalledFunction();
++                if (StringRef(callee->getName().str()).compare(child->getName().str()) == 0) {
++                   std::size_t pos = StringRef(caller->getSection()).find(".fun_ps_");
++                   if (pos == std::string::npos) {
++                       delete parents;
++                       return false;
++                   }
++                   //set level
++                   const char *c = caller->getSection(); //.c_str();
++                   int cur_lev = atoi(c+8);
++                   if (*level == -1) *level = cur_lev;
++                   else {
++                        if (*level < cur_lev ) *level = cur_lev;
++                   }
++                }
++            }
++            delete parents;
++            return true;
++        }
++
++        /*
++         *  Utility to print the state of every function at the end of the elaboration
++         *
++         */
++        void print_tagging_propagation_status(CallGraph *CG) {
++            CallGraph::iterator BCG = CG->begin();
++            CallGraph::iterator ECG = CG->end();
++            std::cout << "------------------STATUS-----------------------" << std::endl;
++            for(; BCG != ECG; ++BCG) {
++                CallGraphNode *CGN = BCG->second;
++                Function *fun = CGN->getFunction();
++                if(!fun || fun->isDeclaration()) continue;
++                if(fun->isDefTriviallyDead()) continue;
++                std::cout << "Function " << fun->getName().str() << " tag " << fun->getSection() << std::endl;
++            }
++        }
++        /*
++         *  Fucntion to obtains all the sons of a certain node already don't removing
++         *  eventually recursive dependency
++         */
++        std::vector<CallGraphNode*>* get_list_sons(CallGraphNode *node) {
++            std::vector<CallGraphNode*> *sons_list = new std::vector<CallGraphNode*>();
++            CallGraphNode::iterator CGNB = node->begin();
++            CallGraphNode::iterator CGNE = node->end();
++            for (; CGNB != CGNE; ++CGNB) {
++                CallGraphNode *Called = CGNB->second;
++                Function *son = Called->getFunction();
++                if (!son || son->isDeclaration() || Called == node ) continue;
++                sons_list->push_back(Called);
++            }
++            return sons_list;
++        }
++
++        /*
++         *  Function to control when the analysis is completed. It travers all the call graph
++         *  and control if every node has the
++         *
++         */
++        bool isPropagated(CallGraph *CG) {
++            CallGraph::iterator BCG = CG->begin();
++            CallGraph::iterator ECG = CG->end();
++            for(; BCG != ECG; ++BCG) {
++                CallGraphNode *CGN = BCG->second;
++                Function *fun = CGN->getFunction();
++                if (!fun || fun->isDeclaration()) continue;
++                if (fun->use_empty()) continue;
++                if (fun->getLinkage() == 7) continue;
++                if (StringRef(fun->getName().str()).compare("_Z12exit_wrapperv") == 0) continue;
++                std::size_t pos = StringRef(fun->getSection()).find(".fun_ps_");
++                if (pos == std::string::npos &&
++                        StringRef(fun->getSection()).compare(".text.startup") != 0) {
++                    return false;
++                }
++            }
++            return true;
++        }
++    };
++}
++
++char TaggingPropagation::ID = 5;
++static RegisterPass<TaggingPropagation> X("TaggingPropagation", "Tagging Propagation pass on the call graph", false, false);
++
++
+diff --git a/utils/kate/llvm.xml b/utils/kate/llvm.xml
+index 5ba46ee..ae93499 100644
+--- a/utils/kate/llvm.xml
++++ b/utils/kate/llvm.xml
+@@ -71,6 +71,7 @@
+       <item> noalias </item>
+       <item> nocapture </item>
+       <item> nest </item>
++      <item> privilegeSeparation </item>
+     </list>
+     <list name="function-attributes">
+       <item> alignstack </item>
+@@ -89,6 +90,7 @@
+       <item> ssp </item>
+       <item> sspreq </item>
+       <item> sspstrong </item>
++      <item> privilege_separation </item>
+     </list>
+     <list name="types">
+       <item> float </item>
+diff --git a/utils/vim/llvm.vim b/utils/vim/llvm.vim
+index 2b91823..f0098a9 100644
+--- a/utils/vim/llvm.vim
++++ b/utils/vim/llvm.vim
+@@ -48,7 +48,7 @@ syn keyword llvmKeyword linkonce linkonce_odr
+ syn keyword llvmKeyword localdynamic localexec minsize module monotonic
+ syn keyword llvmKeyword msp430_intrcc naked nest noalias nocapture
+ syn keyword llvmKeyword noimplicitfloat noinline nonlazybind noredzone noreturn
+-syn keyword llvmKeyword nounwind optnone optsize personality private protected
++syn keyword llvmKeyword nounwind optnone optsize personality private protected privilegeSeparation
+ syn keyword llvmKeyword ptx_device ptx_kernel readnone readonly release
+ syn keyword llvmKeyword returns_twice sanitize_thread sanitize_memory
+ syn keyword llvmKeyword section seq_cst sideeffect signext singlethread
